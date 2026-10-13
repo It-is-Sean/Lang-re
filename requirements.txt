@@ -5,3 +5,4 @@ transformers>=4.38.0
 einops
 safetensors
 huggingface-hub
+numpy

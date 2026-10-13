@@ -283,20 +283,29 @@ class GumbelProposal(nn.Module):
         self.entropy = nn.Parameter(torch.tensor(entropy))
 
     def _get_distribution(self) -> torch.distributions.Gumbel:
-        return torch.distributions.Gumbel(self.loc, self.scale)
+        # P_beta is a scale parameter and must remain positive.  Keep the
+        # checkpoint-compatible parameterization used by the released model,
+        # but guard the distribution against an invalid optimizer update.
+        return torch.distributions.Gumbel(self.loc, self.scale.clamp_min(1e-4))
 
     @property
     def gamma_min(self) -> float:
-        return float(self.loc - math.log(-math.log(self.cutoff)) * self.scale)
+        scale = self.scale.detach().clamp_min(1e-4)
+        return float(self.loc.detach() - math.log(-math.log(self.cutoff)) * scale)
 
     @property
     def gamma_max(self) -> float:
-        return float(self.loc - math.log(self.cutoff) * self.scale)
+        scale = self.scale.detach().clamp_min(1e-4)
+        return float(self.loc.detach() - math.log(self.cutoff) * scale)
 
     def forward(self, q: torch.Tensor) -> torch.Tensor:
         """Convert uniform samples to gamma values via inverse CDF."""
-        gamma = self._get_distribution().icdf(q)
-        return gamma.clamp(min=self.gamma_min, max=self.gamma_max)
+        # Clipping the quantile before the analytic inverse CDF is equivalent
+        # to clipping gamma at the cutoff quantiles, without synchronizing CUDA
+        # tensors through the Python-float gamma_min/gamma_max properties.
+        q = q.clamp(min=self.cutoff, max=1.0 - self.cutoff)
+        scale = self.scale.clamp_min(1e-4)
+        return self.loc - scale * torch.log(-torch.log(q))
 
     def log_pdf(self, gamma: torch.Tensor) -> torch.Tensor:
         """Compute log probability density at gamma."""
@@ -359,12 +368,14 @@ class LangFlowBackbone(nn.Module):
         t_cond = F.silu(self.sigma_map(sigma))
         rotary_cos_sin = self.rotary_emb(x)
 
-        with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
-            for block in self.blocks:
-                x = block(x, rotary_cos_sin, c=t_cond)
-                if output_hidden_states:
-                    all_hidden_states.append(x)
-            x = self.output_layer(x, c=t_cond)
+        # Precision is controlled by the caller.  Keeping an internal CUDA
+        # bfloat16 autocast here would silently override fp32/fp16 training and
+        # makes CPU execution emit CUDA-autocast warnings.
+        for block in self.blocks:
+            x = block(x, rotary_cos_sin, c=t_cond)
+            if output_hidden_states:
+                all_hidden_states.append(x)
+        x = self.output_layer(x, c=t_cond)
 
         return x, all_hidden_states
 
@@ -427,6 +438,7 @@ class LangFlow(transformers.PreTrainedModel):
         x_self_cond: typing.Optional[torch.FloatTensor] = None,
         output_hidden_states: typing.Optional[bool] = None,
         return_dict: typing.Optional[bool] = None,
+        bias_scale: typing.Union[float, torch.Tensor] = 1.0,
     ) -> typing.Union[torch.Tensor, typing.Tuple, transformers.modeling_outputs.MaskedLMOutput]:
         """Forward pass for LangFlow.
         
@@ -435,6 +447,9 @@ class LangFlow(transformers.PreTrainedModel):
             noisy_embeds: [B, L, D] - Pre-noised embeddings (alternative to input_ids)
             timesteps: [B] - Gamma values (log-SNR) for conditioning
             x_self_cond: [B, L, D] - Self-conditioning embeddings
+            bias_scale: Multiplier for the preconditioning skip connection.
+                Training ramps this from zero to one during warmup; inference
+                uses the default value of one.
             output_hidden_states: Whether to return hidden states
             return_dict: Whether to return MaskedLMOutput
         
@@ -474,7 +489,7 @@ class LangFlow(transformers.PreTrainedModel):
             c_skip = ((F.softplus(-sigma) - sigma) / 2).exp()
             embedding = self._get_embedding_matrix()
             skip_logits = torch.matmul(z.float(), embedding.t().float())
-            logits = logits + c_skip[:, None, None] * skip_logits.to(logits.dtype)
+            logits = logits + bias_scale * c_skip[:, None, None] * skip_logits.to(logits.dtype)
 
         if return_dict:
             return transformers.modeling_outputs.MaskedLMOutput(
