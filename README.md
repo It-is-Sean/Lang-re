@@ -31,8 +31,8 @@ By Yuxin Chen*, Chumeng Liang*, Hangke Sui*, Ruihan Guo, Chaoran Cheng, Jiaxuan 
 ```bash
 conda create -n langflow python=3.12
 conda activate langflow
-# Install CUDA-enabled torch first (adjust cu124 to match your driver)
-pip install torch --index-url https://download.pytorch.org/whl/cu124
+# Driver 550 on the training host supports CUDA 12.x, not CUDA 13.x.
+pip install torch==2.6.0 --index-url https://download.pytorch.org/whl/cu124
 pip install -r requirements.txt
 ```
 
@@ -104,6 +104,16 @@ uses 1M updates for LM1B/OWT). Resume with either
 model, EMA, optimizer, LR scheduler, scaler, data position, and RNG state. At
 the end of training, Hugging Face-compatible weights are exported to
 `final-model/` and `final-ema/`.
+
+To checkpoint and exit a running job cleanly after its next complete optimizer
+update, create a marker in that run directory:
+
+```bash
+touch results/langflow-tinystories-*/SAVE_AND_STOP
+```
+
+Rank zero writes the checkpoint atomically and all distributed ranks exit
+together. Resume it with `--resume /path/to/step-XXXXXXX.pt`.
 
 Useful development smoke test:
 

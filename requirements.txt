@@ -1,6 +1,7 @@
 # Install torch with CUDA support first (see README):
 #   pip install torch --index-url https://download.pytorch.org/whl/cu124
-torch>=2.0.0
+# Install this from the cu124 index first; see README.md.
+torch==2.6.0
 transformers>=4.38.0
 einops
 safetensors

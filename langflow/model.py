@@ -15,13 +15,6 @@ import transformers
 from .config import LangFlowConfig
 
 
-# Flags required to enable jit fusion kernels
-torch._C._jit_set_profiling_mode(False)
-torch._C._jit_set_profiling_executor(False)
-torch._C._jit_override_can_fuse_on_cpu(True)
-torch._C._jit_override_can_fuse_on_gpu(True)
-
-
 def bias_dropout_add_scale(
     x: torch.Tensor,
     bias: typing.Optional[torch.Tensor],
@@ -39,7 +32,6 @@ def bias_dropout_add_scale(
     return out
 
 
-@torch.jit.script
 def bias_dropout_add_scale_fused_train(
     x: torch.Tensor,
     bias: typing.Optional[torch.Tensor],
@@ -49,7 +41,6 @@ def bias_dropout_add_scale_fused_train(
     return bias_dropout_add_scale(x, bias, scale, residual, prob, True)
 
 
-@torch.jit.script
 def bias_dropout_add_scale_fused_inference(
     x: torch.Tensor,
     bias: typing.Optional[torch.Tensor],
@@ -59,7 +50,6 @@ def bias_dropout_add_scale_fused_inference(
     return bias_dropout_add_scale(x, bias, scale, residual, prob, False)
 
 
-@torch.jit.script
 def modulate_fused(x: torch.Tensor,
                    shift: torch.Tensor,
                    scale: torch.Tensor) -> torch.Tensor:

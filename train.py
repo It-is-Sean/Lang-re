@@ -20,6 +20,7 @@ import contextlib
 import copy
 import json
 import logging
+import multiprocessing as mp
 import os
 import random
 import time
@@ -41,6 +42,8 @@ from langflow import LangFlow, LangFlowConfig
 
 LOGGER = logging.getLogger("langflow.train")
 PROJECT_DIR = Path(__file__).resolve().parent
+_PREPROCESS_TOKENIZER = None
+_PREPROCESS_DTYPE: np.dtype | None = None
 
 
 @dataclass(frozen=True)
@@ -75,7 +78,22 @@ def setup_distributed() -> DistributedContext:
 
 def barrier(ctx: DistributedContext) -> None:
     if ctx.world_size > 1:
-        dist.barrier()
+        if ctx.device.type == "cuda":
+            dist.barrier(device_ids=[ctx.local_rank])
+        else:
+            dist.barrier()
+
+
+def save_and_stop_requested(output_dir: Path, ctx: DistributedContext) -> bool:
+    """Synchronize a file-based graceful-stop request across every rank."""
+    requested = torch.tensor(
+        int(ctx.is_main and (output_dir / "SAVE_AND_STOP").is_file()),
+        dtype=torch.int32,
+        device=ctx.device,
+    )
+    if ctx.world_size > 1:
+        dist.broadcast(requested, src=0)
+    return bool(requested.item())
 
 
 def configure_logging(output_dir: Path, ctx: DistributedContext) -> None:
@@ -116,24 +134,85 @@ def _iter_text_chunks(path: Path, target_chars: int = 1 << 20) -> Iterator[str]:
         yield "".join(lines)
 
 
-def _tokenize_file(raw_path: Path, output_path: Path, tokenizer, dtype: np.dtype) -> int:
+def _init_preprocess_worker(tokenizer_path: str, dtype_name: str) -> None:
+    """Load one tokenizer per worker and avoid nested tokenizer thread pools."""
+    global _PREPROCESS_TOKENIZER, _PREPROCESS_DTYPE
+    os.environ["TOKENIZERS_PARALLELISM"] = "false"
+    _PREPROCESS_TOKENIZER = AutoTokenizer.from_pretrained(
+        tokenizer_path,
+        use_fast=True,
+        local_files_only=True,
+    )
+    _PREPROCESS_TOKENIZER.model_max_length = int(1e30)
+    _PREPROCESS_DTYPE = np.dtype(dtype_name)
+
+
+def _tokenize_chunk(text: str) -> np.ndarray:
+    if _PREPROCESS_TOKENIZER is None or _PREPROCESS_DTYPE is None:
+        raise RuntimeError("Preprocessing worker was not initialized")
+    token_ids = _PREPROCESS_TOKENIZER(
+        text,
+        add_special_tokens=False,
+        return_attention_mask=False,
+        return_token_type_ids=False,
+    )["input_ids"]
+    return np.asarray(token_ids, dtype=_PREPROCESS_DTYPE)
+
+
+def _tokenize_file(
+    raw_path: Path,
+    output_path: Path,
+    tokenizer,
+    dtype: np.dtype,
+    preprocess_workers: int,
+    worker_tokenizer_path: Path,
+) -> int:
     temp_path = output_path.with_suffix(output_path.suffix + ".tmp")
     token_count = 0
+    pool = None
     try:
         with temp_path.open("wb") as output:
-            for chunk_index, text in enumerate(_iter_text_chunks(raw_path), start=1):
-                token_ids = tokenizer(
-                    text,
-                    add_special_tokens=False,
-                    return_attention_mask=False,
-                    return_token_type_ids=False,
-                )["input_ids"]
-                values = np.asarray(token_ids, dtype=dtype)
+            if preprocess_workers == 1:
+                tokenized_chunks = (
+                    np.asarray(
+                        tokenizer(
+                            text,
+                            add_special_tokens=False,
+                            return_attention_mask=False,
+                            return_token_type_ids=False,
+                        )["input_ids"],
+                        dtype=dtype,
+                    )
+                    for text in _iter_text_chunks(raw_path)
+                )
+            else:
+                LOGGER.info(
+                    "Tokenizing %s with %d worker processes",
+                    raw_path.name,
+                    preprocess_workers,
+                )
+                pool = mp.get_context("spawn").Pool(
+                    processes=preprocess_workers,
+                    initializer=_init_preprocess_worker,
+                    initargs=(str(worker_tokenizer_path), dtype.name),
+                )
+                tokenized_chunks = pool.imap(_tokenize_chunk, _iter_text_chunks(raw_path), chunksize=1)
+
+            for chunk_index, values in enumerate(tokenized_chunks, start=1):
                 values.tofile(output)
                 token_count += int(values.size)
-                if chunk_index % 100 == 0:
-                    LOGGER.info("Tokenized %s: %,d tokens", raw_path.name, token_count)
+                if chunk_index % 25 == 0:
+                    LOGGER.info("Tokenized %s: %s tokens", raw_path.name, f"{token_count:,}")
+        if pool is not None:
+            pool.close()
+            pool.join()
+            pool = None
         os.replace(temp_path, output_path)
+    except BaseException:
+        if pool is not None:
+            pool.terminate()
+            pool.join()
+        raise
     finally:
         if temp_path.exists():
             temp_path.unlink()
@@ -144,6 +223,7 @@ def prepare_tinystories(
     data_dir: Path,
     cache_dir: Path,
     tokenizer_name: str,
+    preprocess_workers: int,
     ctx: DistributedContext,
 ) -> dict:
     """Build reusable train/validation token memmaps on rank zero."""
@@ -159,6 +239,10 @@ def prepare_tinystories(
             raise FileNotFoundError("Missing TinyStoriesV2 files: " + ", ".join(missing))
 
         tokenizer = AutoTokenizer.from_pretrained(tokenizer_name, use_fast=True)
+        # These chunks are only being tokenized into a flat cache; they are
+        # never passed to GPT-2 as one sequence.  Disable the tokenizer's
+        # model-context warning and split into training blocks below instead.
+        tokenizer.model_max_length = int(1e30)
         dtype = np.dtype("uint16" if len(tokenizer) <= np.iinfo(np.uint16).max else "uint32")
         fingerprint = {
             "tokenizer": tokenizer_name,
@@ -178,9 +262,18 @@ def prepare_tinystories(
 
         if cached is None or cached.get("fingerprint") != fingerprint or not bins_exist:
             cache_dir.mkdir(parents=True, exist_ok=True)
+            worker_tokenizer_path = cache_dir / "tokenizer"
+            tokenizer.save_pretrained(worker_tokenizer_path)
             LOGGER.info("Preparing TinyStoriesV2 token cache in %s", cache_dir)
             counts = {
-                split: _tokenize_file(path, cache_dir / f"{split}.bin", tokenizer, dtype)
+                split: _tokenize_file(
+                    path,
+                    cache_dir / f"{split}.bin",
+                    tokenizer,
+                    dtype,
+                    preprocess_workers,
+                    worker_tokenizer_path,
+                )
                 for split, path in raw_paths.items()
             }
             metadata = {"fingerprint": fingerprint, "token_counts": counts}
@@ -320,7 +413,12 @@ def precision_context(precision: str, device: torch.device):
     if device.type != "cuda" or precision == "fp32":
         return contextlib.nullcontext()
     dtype = torch.bfloat16 if precision == "bf16" else torch.float16
-    return torch.autocast(device_type="cuda", dtype=dtype)
+    # The objective performs a no-grad self-conditioning forward before its
+    # grad-enabled denoising forward.  With autocast's weight cache enabled,
+    # low-precision Linear weights first cast under no_grad are cached without
+    # autograd history and then reused by the denoising pass.  That silently
+    # leaves the Linear parameters without gradients and breaks DDP reduction.
+    return torch.autocast(device_type="cuda", dtype=dtype, cache_enabled=False)
 
 
 def reduce_metrics(values: torch.Tensor, ctx: DistributedContext) -> torch.Tensor:
@@ -464,6 +562,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--global_batch_size", type=int, default=512)
     parser.add_argument("--micro_batch_size", type=int, default=2)
     parser.add_argument("--num_workers", type=int, default=4)
+    parser.add_argument(
+        "--preprocess_workers",
+        type=int,
+        default=8,
+        help="Processes used by rank zero to build the token cache; one disables multiprocessing",
+    )
     parser.add_argument("--learning_rate", type=float, default=3e-4)
     parser.add_argument("--weight_decay", type=float, default=0.0)
     parser.add_argument("--adam_beta1", type=float, default=0.9)
@@ -500,9 +604,11 @@ def main() -> None:
     accumulation_steps = args.global_batch_size // (ctx.world_size * args.micro_batch_size)
     if not 0 <= args.self_condition_probability <= 1:
         raise ValueError("self_condition_probability must be between zero and one")
+    if args.preprocess_workers < 1:
+        raise ValueError("preprocess_workers must be at least one")
 
     cache_dir = args.cache_dir or args.data_dir / f"tokenized-{args.tokenizer.replace('/', '--')}"
-    metadata = prepare_tinystories(args.data_dir, cache_dir, args.tokenizer, ctx)
+    metadata = prepare_tinystories(args.data_dir, cache_dir, args.tokenizer, args.preprocess_workers, ctx)
     tokenizer = AutoTokenizer.from_pretrained(args.tokenizer, use_fast=True)
 
     if args.init_from:
@@ -555,7 +661,15 @@ def main() -> None:
     ema.requires_grad_(False)
     objective = LangFlowTrainingObjective(model, args.self_condition_probability).to(ctx.device)
     if ctx.world_size > 1:
-        objective = DDP(objective, device_ids=[ctx.local_rank] if ctx.device.type == "cuda" else None)
+        objective = DDP(
+            objective,
+            device_ids=[ctx.local_rank] if ctx.device.type == "cuda" else None,
+            # Every trainable parameter participates in the main denoising
+            # pass.  Unused-parameter discovery is both unnecessary and, in
+            # PyTorch 2.6, can corrupt reducer state when combined with the
+            # accumulated no_sync passes below.
+            find_unused_parameters=False,
+        )
 
     optimizer = torch.optim.AdamW(
         model.parameters(),
@@ -568,7 +682,7 @@ def main() -> None:
         optimizer,
         lambda step: min(1.0, (step + 1) / max(1, args.warmup_steps)),
     )
-    scaler = torch.cuda.amp.GradScaler(enabled=args.precision == "fp16" and ctx.device.type == "cuda")
+    scaler = torch.amp.GradScaler("cuda", enabled=args.precision == "fp16" and ctx.device.type == "cuda")
 
     start_step = 0
     start_epoch = 0
@@ -590,7 +704,13 @@ def main() -> None:
             # not clone it onto every worker, which would correlate diffusion
             # noise and self-conditioning masks across GPUs.
             seed_everything(args.seed + start_step * ctx.world_size, ctx.rank)
-        LOGGER.info("Resumed %s at step %,d, epoch %d, batch %d", resume_path, start_step, start_epoch, start_batch)
+        LOGGER.info(
+            "Resumed %s at step %s, epoch %d, batch %d",
+            resume_path,
+            f"{start_step:,}",
+            start_epoch,
+            start_batch,
+        )
     else:
         update_ema(ema, model, decay=0.0)
 
@@ -599,10 +719,10 @@ def main() -> None:
         with (args.output_dir / "args.json").open("w", encoding="utf-8") as handle:
             json.dump(vars(args), handle, indent=2, default=str)
         LOGGER.info(
-            "Model parameters: %,d | train blocks: %,d | validation blocks: %,d",
-            sum(parameter.numel() for parameter in model.parameters()),
-            len(train_dataset),
-            len(valid_dataset),
+            "Model parameters: %s | train blocks: %s | validation blocks: %s",
+            f"{sum(parameter.numel() for parameter in model.parameters()):,}",
+            f"{len(train_dataset):,}",
+            f"{len(valid_dataset):,}",
         )
         LOGGER.info(
             "world_size=%d micro_batch=%d accumulation=%d global_batch=%d sequence_length=%d",
@@ -622,8 +742,10 @@ def main() -> None:
     quantiles_for_rank: torch.Tensor | None = None
     accumulation_index = 0
     stop_training = False
+    save_and_exit = False
     last_epoch = start_epoch
     last_batch = start_batch
+    first_logged_step = start_step + 1
 
     for epoch in range(start_epoch, args.epochs):
         last_epoch = epoch
@@ -646,10 +768,14 @@ def main() -> None:
             if isinstance(objective, DDP) and not final_micro_step:
                 sync_context = objective.no_sync()
 
-            with sync_context, precision_context(args.precision, ctx.device):
-                total_loss, ce_loss, scheduler_loss = objective(input_ids, quantiles, bias_scale)
-                scaled_loss = total_loss / accumulation_steps
-            scaler.scale(scaled_loss).backward()
+            # DDP requires both forward and backward to stay inside no_sync;
+            # leaving the context before backward corrupts reducer state on
+            # the next accumulated micro-batch.
+            with sync_context:
+                with precision_context(args.precision, ctx.device):
+                    total_loss, ce_loss, scheduler_loss = objective(input_ids, quantiles, bias_scale)
+                    scaled_loss = total_loss / accumulation_steps
+                scaler.scale(scaled_loss).backward()
             running += torch.stack((total_loss.detach(), ce_loss, scheduler_loss)) / accumulation_steps
             accumulation_index += 1
 
@@ -672,12 +798,13 @@ def main() -> None:
             quantiles_for_rank = None
             running_updates += 1
 
-            if step % args.log_every == 0:
+            if step == first_logged_step or step % args.log_every == 0:
                 metrics = reduce_metrics(running / max(1, running_updates), ctx)
                 elapsed = time.monotonic() - log_started
                 if ctx.is_main:
                     LOGGER.info(
-                        "step=%07d epoch=%d loss=%.4f ce=%.4f scheduler=%.4f lr=%.3e steps/s=%.3f",
+                        "step=%07d epoch=%d loss=%.4f ce=%.4f scheduler=%.4f lr=%.3e "
+                        "steps/s=%.3f peak_memory_gib=%.2f",
                         step,
                         epoch,
                         metrics[0].item(),
@@ -685,6 +812,8 @@ def main() -> None:
                         metrics[2].item(),
                         optimizer.param_groups[0]["lr"],
                         running_updates / max(elapsed, 1e-9),
+                        torch.cuda.max_memory_allocated(ctx.device) / 2**30
+                        if ctx.device.type == "cuda" else 0.0,
                     )
                     LOGGER.info(
                         "proposal loc=%.4f scale=%.4f entropy=%.4f bias_scale=%.4f",
@@ -696,6 +825,20 @@ def main() -> None:
                 running.zero_()
                 running_updates = 0
                 log_started = time.monotonic()
+
+            if save_and_stop_requested(args.output_dir, ctx):
+                if ctx.is_main:
+                    checkpoint_path = checkpoint_dir / f"step-{step:07d}.pt"
+                    save_checkpoint(
+                        checkpoint_path, objective, ema, optimizer, lr_scheduler, scaler,
+                        args, step, epoch, batch_index + 1,
+                    )
+                    LOGGER.info("Saved %s", checkpoint_path)
+                    LOGGER.info("Saved current progress and stopped by SAVE_AND_STOP request")
+                barrier(ctx)
+                save_and_exit = True
+                stop_training = True
+                break
 
             if args.validate_every > 0 and step % args.validate_every == 0:
                 validation_ce = validate(ema, valid_loader, ctx, args.precision, args.validation_batches)
@@ -732,7 +875,7 @@ def main() -> None:
         last_epoch = epoch + 1
 
     barrier(ctx)
-    if ctx.is_main:
+    if ctx.is_main and not save_and_exit:
         final_checkpoint = checkpoint_dir / f"step-{step:07d}-final.pt"
         save_checkpoint(
             final_checkpoint, objective, ema, optimizer, lr_scheduler, scaler,
@@ -744,7 +887,7 @@ def main() -> None:
         ema.save_pretrained(ema_dir, safe_serialization=True)
         tokenizer.save_pretrained(model_dir)
         tokenizer.save_pretrained(ema_dir)
-        LOGGER.info("Training complete at step %,d; exported model and EMA", step)
+        LOGGER.info("Training complete at step %s; exported model and EMA", f"{step:,}")
 
     barrier(ctx)
     if ctx.world_size > 1:
