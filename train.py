@@ -1,4 +1,4 @@
-"""Train LangFlow on TinyStoriesV2 with the objective from the paper.
+"""Train LangFlow on fixed-length token blocks with the paper objective.
 
 The implementation follows Algorithm 1 of arXiv:2604.11748:
 
@@ -8,9 +8,10 @@ The implementation follows Algorithm 1 of arXiv:2604.11748:
 * fit the proposal to the detached per-example CE curve; and
 * use one detached model prediction for self-conditioning with probability .25.
 
-The first run tokenizes the two raw TinyStories files into flat memmaps.  All
-subsequent runs use the memmaps directly.  Both regular Python and ``torchrun``
-launches are supported.
+TinyStories raw text and the split ROCStories caches produced by ``train_ar.py``
+are supported.  Both are converted to flat memmaps and then packed into
+non-overlapping fixed-length blocks.  Regular Python and ``torchrun`` launches
+are supported.
 """
 
 from __future__ import annotations
@@ -291,6 +292,113 @@ def prepare_tinystories(
         return json.load(handle)
 
 
+def prepare_rocstories(
+    sequence_cache_dir: Path,
+    cache_dir: Path,
+    tokenizer_name: str,
+    ctx: DistributedContext,
+) -> dict:
+    """Pack the exact train/validation split made by ``train_ar.py``.
+
+    The source arrays contain one padded 64-token row per story plus its true
+    length.  Only true tokens (including the terminal EOS) are flattened, so
+    bidirectional LangFlow attention never sees padding.  Story boundaries are
+    retained by EOS tokens.
+    """
+    metadata_path = cache_dir / "metadata.json"
+    source_metadata_path = sequence_cache_dir / "metadata.json"
+    source_paths = {
+        split: (
+            sequence_cache_dir / f"{split}-tokens.npy",
+            sequence_cache_dir / f"{split}-lengths.npy",
+        )
+        for split in ("train", "validation")
+    }
+
+    if ctx.is_main:
+        required = [source_metadata_path]
+        for token_path, length_path in source_paths.values():
+            required.extend((token_path, length_path))
+        missing = [str(path) for path in required if not path.is_file()]
+        if missing:
+            raise FileNotFoundError("Missing ROCStories token-cache files: " + ", ".join(missing))
+
+        source_metadata = json.loads(source_metadata_path.read_text(encoding="utf-8"))
+        source_fingerprint = source_metadata.get("fingerprint", {})
+        if source_fingerprint.get("tokenizer") != tokenizer_name:
+            raise ValueError(
+                f"ROCStories cache tokenizer {source_fingerprint.get('tokenizer')!r} "
+                f"does not match requested tokenizer {tokenizer_name!r}"
+            )
+        train_tokens = np.load(source_paths["train"][0], mmap_mode="r")
+        dtype = train_tokens.dtype
+        fingerprint = {
+            "dataset": "rocstories",
+            "tokenizer": tokenizer_name,
+            "vocab_size": int(source_fingerprint.get("vocab_size", 50_257)),
+            "dtype": dtype.name,
+            "source_fingerprint": source_fingerprint,
+            "sources": {
+                split: {
+                    "tokens": {
+                        "path": str(token_path.resolve()),
+                        "size": token_path.stat().st_size,
+                        "mtime_ns": token_path.stat().st_mtime_ns,
+                    },
+                    "lengths": {
+                        "path": str(length_path.resolve()),
+                        "size": length_path.stat().st_size,
+                        "mtime_ns": length_path.stat().st_mtime_ns,
+                    },
+                }
+                for split, (token_path, length_path) in source_paths.items()
+            },
+        }
+        cached = json.loads(metadata_path.read_text(encoding="utf-8")) if metadata_path.is_file() else None
+        bins_exist = all((cache_dir / f"{split}.bin").is_file() for split in source_paths)
+        if cached is None or cached.get("fingerprint") != fingerprint or not bins_exist:
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            counts: dict[str, int] = {}
+            story_counts: dict[str, int] = {}
+            LOGGER.info("Packing ROCStories token cache from %s into %s", sequence_cache_dir, cache_dir)
+            for split, (token_path, length_path) in source_paths.items():
+                tokens = np.load(token_path, mmap_mode="r")
+                lengths = np.load(length_path, mmap_mode="r")
+                temporary = (cache_dir / f"{split}.bin").with_suffix(".bin.tmp")
+                token_count = 0
+                with temporary.open("wb") as output:
+                    for start in range(0, len(lengths), 4096):
+                        stop = min(start + 4096, len(lengths))
+                        packed = np.concatenate([
+                            np.asarray(tokens[index, : int(lengths[index])], dtype=dtype)
+                            for index in range(start, stop)
+                        ])
+                        packed.tofile(output)
+                        token_count += int(packed.size)
+                os.replace(temporary, cache_dir / f"{split}.bin")
+                counts[split] = token_count
+                story_counts[split] = len(lengths)
+                LOGGER.info(
+                    "Packed %s ROCStories: %s stories, %s tokens",
+                    split, f"{len(lengths):,}", f"{token_count:,}",
+                )
+            metadata = {
+                "fingerprint": fingerprint,
+                "token_counts": counts,
+                "story_counts": story_counts,
+            }
+            temporary_metadata = metadata_path.with_suffix(".json.tmp")
+            temporary_metadata.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+            os.replace(temporary_metadata, metadata_path)
+        else:
+            LOGGER.info("Using existing packed ROCStories cache in %s", cache_dir)
+
+    barrier(ctx)
+    if not metadata_path.is_file():
+        raise RuntimeError(f"ROCStories cache preparation failed: {metadata_path} was not created")
+    return json.loads(metadata_path.read_text(encoding="utf-8"))
+
+
 class TokenBlockDataset(Dataset[torch.Tensor]):
     """Non-overlapping fixed-length views over a flat token memmap."""
 
@@ -548,6 +656,7 @@ def validate(
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     parser.add_argument("--data_dir", type=Path, default=PROJECT_DIR.parent.parent / "datasets/TinyStoriesV2")
+    parser.add_argument("--dataset", choices=("tinystories", "rocstories"), default="tinystories")
     parser.add_argument("--cache_dir", type=Path, default=None)
     parser.add_argument("--output_dir", type=Path, default=PROJECT_DIR / "results/langflow-tinystories")
     parser.add_argument("--config", type=Path, default=PROJECT_DIR / "langflow/config.json")
@@ -585,6 +694,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--validate_every", type=int, default=5000)
     parser.add_argument("--validation_batches", type=int, default=50)
     parser.add_argument("--checkpoint_every", type=int, default=5000)
+    parser.add_argument(
+        "--save_every_fraction",
+        type=float,
+        default=0.0,
+        help="Save and validate this many epochs apart; zero disables fractional checkpoints",
+    )
     parser.add_argument("--keep_checkpoints", type=int, default=0, help="Keep newest N; zero keeps every checkpoint")
     return parser
 
@@ -606,9 +721,15 @@ def main() -> None:
         raise ValueError("self_condition_probability must be between zero and one")
     if args.preprocess_workers < 1:
         raise ValueError("preprocess_workers must be at least one")
+    if args.save_every_fraction < 0 or args.save_every_fraction > 1:
+        raise ValueError("save_every_fraction must be in [0, 1]")
 
-    cache_dir = args.cache_dir or args.data_dir / f"tokenized-{args.tokenizer.replace('/', '--')}"
-    metadata = prepare_tinystories(args.data_dir, cache_dir, args.tokenizer, args.preprocess_workers, ctx)
+    if args.dataset == "rocstories":
+        cache_dir = args.cache_dir or args.data_dir.parent / f"{args.data_dir.name}-packed"
+        metadata = prepare_rocstories(args.data_dir, cache_dir, args.tokenizer, ctx)
+    else:
+        cache_dir = args.cache_dir or args.data_dir / f"tokenized-{args.tokenizer.replace('/', '--')}"
+        metadata = prepare_tinystories(args.data_dir, cache_dir, args.tokenizer, args.preprocess_workers, ctx)
     tokenizer = AutoTokenizer.from_pretrained(args.tokenizer, use_fast=True)
 
     if args.init_from:
@@ -655,6 +776,19 @@ def main() -> None:
         persistent_workers=args.num_workers > 0,
         generator=torch.Generator().manual_seed(args.seed + 10_000 + ctx.rank),
     )
+    complete_updates_per_epoch = len(train_loader) // accumulation_steps
+    if complete_updates_per_epoch < 1:
+        raise ValueError("Not enough training batches for one optimizer update")
+    fractional_save_updates: list[int] = []
+    if args.save_every_fraction > 0:
+        fractional_save_updates = sorted({
+            min(complete_updates_per_epoch, max(1, math.ceil(complete_updates_per_epoch * fraction)))
+            for fraction in np.arange(
+                args.save_every_fraction,
+                1.0 + args.save_every_fraction / 2,
+                args.save_every_fraction,
+            )
+        })
 
     model.to(ctx.device)
     ema = copy.deepcopy(model).to(ctx.device).eval()
@@ -732,6 +866,13 @@ def main() -> None:
             args.global_batch_size,
             sequence_length,
         )
+        LOGGER.info(
+            "epochs=%d updates_per_epoch=%d total_updates=%d fractional_save_updates=%s",
+            args.epochs,
+            complete_updates_per_epoch,
+            complete_updates_per_epoch * args.epochs,
+            fractional_save_updates,
+        )
 
     model.train()
     optimizer.zero_grad(set_to_none=True)
@@ -750,7 +891,10 @@ def main() -> None:
     for epoch in range(start_epoch, args.epochs):
         last_epoch = epoch
         train_sampler.set_epoch(epoch)
+        update_in_epoch = start_batch // accumulation_steps if epoch == start_epoch else 0
         for batch_index, input_ids in enumerate(train_loader):
+            if update_in_epoch >= complete_updates_per_epoch:
+                break
             if args.max_steps > 0 and step >= args.max_steps:
                 stop_training = True
                 break
@@ -793,6 +937,7 @@ def main() -> None:
             optimizer.zero_grad(set_to_none=True)
             lr_scheduler.step()
             step += 1
+            update_in_epoch += 1
             update_ema(ema, model, args.ema_decay)
             accumulation_index = 0
             quantiles_for_rank = None
@@ -857,6 +1002,23 @@ def main() -> None:
                     if args.keep_checkpoints > 0:
                         for old_checkpoint in checkpoints[:-args.keep_checkpoints]:
                             old_checkpoint.unlink()
+                barrier(ctx)
+
+            if update_in_epoch in fractional_save_updates:
+                validation_ce = validate(ema, valid_loader, ctx, args.precision, args.validation_batches)
+                epoch_progress = epoch + update_in_epoch / complete_updates_per_epoch
+                if ctx.is_main:
+                    LOGGER.info(
+                        "epoch=%.3f step=%07d validation_ce=%.4f",
+                        epoch_progress, step, validation_ce,
+                    )
+                    label = f"{epoch_progress:06.1f}"
+                    checkpoint_path = checkpoint_dir / f"epoch-{label}-step-{step:07d}.pt"
+                    save_checkpoint(
+                        checkpoint_path, objective, ema, optimizer, lr_scheduler, scaler,
+                        args, step, epoch, batch_index + 1,
+                    )
+                    LOGGER.info("Saved %s", checkpoint_path)
                 barrier(ctx)
 
             if args.max_steps > 0 and step >= args.max_steps:
