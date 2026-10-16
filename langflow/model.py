@@ -517,6 +517,8 @@ class LangFlow(transformers.PreTrainedModel):
         seq_length: typing.Optional[int] = None,
         num_steps: int = 128,
         device: typing.Optional[torch.device] = None,
+        attention_mask: typing.Optional[torch.Tensor] = None,
+        eos_token_id: typing.Optional[int] = None,
     ) -> torch.LongTensor:
         """Generate samples using Euler-EDM solver.
         
@@ -533,6 +535,17 @@ class LangFlow(transformers.PreTrainedModel):
             seq_length = self.config.model_length
         if device is None:
             device = next(self.parameters()).device
+        if attention_mask is not None:
+            attention_mask = attention_mask.to(device=device, dtype=torch.bool)
+            if attention_mask.shape != (num_samples, seq_length):
+                raise ValueError(
+                    f"attention_mask must have shape {(num_samples, seq_length)}, "
+                    f"got {tuple(attention_mask.shape)}"
+                )
+            if not bool(attention_mask[:, 0].all()):
+                raise ValueError("Every generated sequence must contain at least one token")
+            if eos_token_id is None:
+                raise ValueError("eos_token_id is required with attention_mask")
 
         embed_dim = self.config.hidden_size
         eps = 1e-5
@@ -558,6 +571,7 @@ class LangFlow(transformers.PreTrainedModel):
                 noisy_embeds=z,
                 timesteps=gamma_expanded,
                 x_self_cond=x_self_cond,
+                attention_mask=attention_mask,
                 return_dict=False)
 
             # Convert logits to embedding prediction
@@ -578,7 +592,19 @@ class LangFlow(transformers.PreTrainedModel):
             noisy_embeds=z,
             timesteps=gamma_expanded,
             x_self_cond=x_self_cond,
+            attention_mask=attention_mask,
             return_dict=False)
         samples = logits.argmax(dim=-1)
+
+        if attention_mask is not None:
+            samples = samples.masked_fill(~attention_mask, eos_token_id)
+            terminal_positions = attention_mask.sum(dim=1) - 1
+            samples.scatter_(
+                1,
+                terminal_positions[:, None],
+                torch.full(
+                    (num_samples, 1), eos_token_id,
+                    dtype=samples.dtype, device=samples.device),
+            )
 
         return samples

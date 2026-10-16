@@ -119,6 +119,31 @@ def select_references(
     return selected.astype(np.int64).tolist(), references
 
 
+def sample_target_lengths(
+    cache_dir: Path,
+    num_samples: int,
+    sequence_length: int,
+    seed: int,
+) -> list[int]:
+    """Draw unconditional generation lengths from the training distribution."""
+    train_lengths = np.load(cache_dir / "train-lengths.npy", mmap_mode="r")
+    eligible = np.asarray(train_lengths[(train_lengths > 1)], dtype=np.int64)
+    if not len(eligible):
+        raise ValueError("Training cache contains no valid generation lengths")
+    sampled = np.random.default_rng(seed).choice(
+        eligible, size=num_samples, replace=True
+    )
+    return np.clip(sampled, 2, sequence_length).astype(np.int64).tolist()
+
+
+def truncate_at_eos(token_ids: list[int], eos_token_id: int) -> list[int]:
+    try:
+        end = token_ids.index(eos_token_id) + 1
+    except ValueError:
+        end = len(token_ids)
+    return token_ids[:end]
+
+
 @torch.inference_mode()
 def generate_samples(
     model: LangFlow,
@@ -129,6 +154,8 @@ def generate_samples(
     seed: int,
     device: torch.device,
     precision: str,
+    target_lengths: list[int],
+    eos_token_id: int,
 ) -> list[list[int]]:
     if num_steps < 2:
         raise ValueError("num_steps must be at least two")
@@ -140,14 +167,27 @@ def generate_samples(
     generated: list[list[int]] = []
     for start in range(0, num_samples, batch_size):
         current_batch = min(batch_size, num_samples - start)
+        batch_lengths = torch.tensor(
+            target_lengths[start : start + current_batch],
+            dtype=torch.long, device=device,
+        )
+        attention_mask = (
+            torch.arange(sequence_length, device=device)[None, :]
+            < batch_lengths[:, None]
+        )
         with autocast_context(device, precision):
             token_ids = model.generate_samples(
                 num_samples=current_batch,
                 seq_length=sequence_length,
                 num_steps=num_steps,
                 device=device,
+                attention_mask=attention_mask,
+                eos_token_id=eos_token_id,
             )
-        generated.extend(token_ids.cpu().tolist())
+        generated.extend(
+            truncate_at_eos(ids, eos_token_id)
+            for ids in token_ids.cpu().tolist()
+        )
         LOGGER.info("Generated %d/%d samples", len(generated), num_samples)
     return generated
 
@@ -272,10 +312,15 @@ def main() -> None:
             args.cache_dir, split, args.num_samples_per_split,
             args.seed + split_number,
         )
+        target_lengths = sample_target_lengths(
+            args.cache_dir, args.num_samples_per_split, args.sequence_length,
+            args.seed + 20_000 + split_number,
+        )
         generated_ids = generate_samples(
             generator, args.num_samples_per_split, args.sequence_length,
             args.num_steps, args.generation_batch_size,
             args.seed + 10_000 + split_number, device, args.precision,
+            target_lengths, tokenizer.eos_token_id,
         )
         reference_texts = tokenizer.batch_decode(reference_ids, skip_special_tokens=True)
         generated_texts = tokenizer.batch_decode(generated_ids, skip_special_tokens=True)
@@ -288,6 +333,7 @@ def main() -> None:
             "reference_texts": reference_texts,
             "generated_texts": generated_texts,
             "sample_entropy": mean_unigram_entropy(generated_ids),
+            "mean_target_tokens": float(np.mean(target_lengths)),
             "mean_generated_tokens": float(np.mean([len(ids) for ids in generated_ids])),
             "mean_reference_tokens": float(np.mean([len(ids) for ids in reference_ids])),
         }
