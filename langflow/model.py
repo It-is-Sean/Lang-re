@@ -106,16 +106,12 @@ def split_and_apply_rotary_pos_emb(qkv, rotary_cos_sin):
     return q, k, v
 
 
-def regular_attention_multi_headed(q, k, v, attention_mask=None):
-    if attention_mask is not None:
-        # SDPA boolean masks use True for keys that participate in attention.
-        # [B, L] broadcasts across heads and query positions.
-        attention_mask = attention_mask[:, None, None, :].to(torch.bool)
+def regular_attention_multi_headed(q, k, v):
     attention_output = F.scaled_dot_product_attention(
         query=q.transpose(1, 2),
         key=k.transpose(1, 2),
         value=v.transpose(1, 2),
-        attn_mask=attention_mask,
+        attn_mask=None,
         dropout_p=0.0,
         is_causal=False)
     attention_output = attention_output.transpose(1, 2)
@@ -191,7 +187,7 @@ class DDiTBlock(nn.Module):
         else:
             return bias_dropout_add_scale_fused_inference
 
-    def forward(self, x, rotary_cos_sin, c, attention_mask=None):
+    def forward(self, x, rotary_cos_sin, c):
         bias_dropout_scale_fn = self._get_bias_dropout_scale()
 
         x_skip = x
@@ -207,7 +203,7 @@ class DDiTBlock(nn.Module):
             three=3,
             h=self.n_heads)
         q, k, v = split_and_apply_rotary_pos_emb(qkv, rotary_cos_sin)
-        x = regular_attention_multi_headed(q, k, v, attention_mask)
+        x = regular_attention_multi_headed(q, k, v)
 
         x = bias_dropout_scale_fn(self.attn_out(x), None, gate_msa, x_skip, self.dropout)
         x = bias_dropout_scale_fn(
@@ -266,7 +262,7 @@ class DDiTFinalLayer(nn.Module):
 
 
 class GumbelProposal(nn.Module):
-    """Learnable Gumbel distribution proposal for sampling gamma (log-SNR)."""
+    """Learnable Gumbel distribution proposal for sampling gamma (log-NSR)."""
     
     def __init__(self, loc: float = 4.723, scale: float = 0.852, 
                  cutoff: float = 1e-5, entropy: float = 7.02):
@@ -339,14 +335,13 @@ class LangFlowBackbone(nn.Module):
         x_embed,
         sigma,
         x_self_cond=None,
-        attention_mask=None,
         output_hidden_states=False,
     ):
         """Forward pass from embeddings.
         
         Args:
             x_embed: [B, L, D] - Input embeddings (possibly noisy)
-            sigma: [B] - Gamma values (log-SNR)
+            sigma: [B] - Gamma values (log-NSR)
             x_self_cond: [B, L, D] - Self-conditioning embeddings (optional)
             output_hidden_states: Whether to return all hidden states
         
@@ -373,7 +368,7 @@ class LangFlowBackbone(nn.Module):
         # bfloat16 autocast here would silently override fp32/fp16 training and
         # makes CPU execution emit CUDA-autocast warnings.
         for block in self.blocks:
-            x = block(x, rotary_cos_sin, c=t_cond, attention_mask=attention_mask)
+            x = block(x, rotary_cos_sin, c=t_cond)
             if output_hidden_states:
                 all_hidden_states.append(x)
         x = self.output_layer(x, c=t_cond)
@@ -389,7 +384,7 @@ class LangFlow(transformers.PreTrainedModel):
     - Self-conditioning: uses previous predictions as additional input
     - Bias (preconditioning): skip connection for improved generation
     - Normalized embeddings: layernorm on embedding vectors
-    - Learnable Gumbel proposal for gamma (log-SNR) sampling
+    - Learnable Gumbel proposal for gamma (log-NSR) sampling
     """
     config_class = LangFlowConfig
     base_model_prefix = "langflow"
@@ -437,7 +432,6 @@ class LangFlow(transformers.PreTrainedModel):
         noisy_embeds: typing.Optional[torch.FloatTensor] = None,
         timesteps: typing.Optional[torch.FloatTensor] = None,
         x_self_cond: typing.Optional[torch.FloatTensor] = None,
-        attention_mask: typing.Optional[torch.Tensor] = None,
         output_hidden_states: typing.Optional[bool] = None,
         return_dict: typing.Optional[bool] = None,
         bias_scale: typing.Union[float, torch.Tensor] = 1.0,
@@ -447,10 +441,8 @@ class LangFlow(transformers.PreTrainedModel):
         Args:
             input_ids: [B, L] - Token IDs (will be embedded and noised if timesteps provided)
             noisy_embeds: [B, L, D] - Pre-noised embeddings (alternative to input_ids)
-            timesteps: [B] - Gamma values (log-SNR) for conditioning
+            timesteps: [B] - Gamma values (log-NSR) for conditioning
             x_self_cond: [B, L, D] - Self-conditioning embeddings
-            attention_mask: [B, L] - True for story tokens, including EOS;
-                False for padding positions ignored by bidirectional attention.
             bias_scale: Multiplier for the preconditioning skip connection.
                 Training ramps this from zero to one during warmup; inference
                 uses the default value of one.
@@ -489,7 +481,6 @@ class LangFlow(transformers.PreTrainedModel):
             z,
             sigma,
             x_self_cond=x_self_cond,
-            attention_mask=attention_mask,
             output_hidden_states=output_hidden_states,
         )
 
@@ -517,8 +508,6 @@ class LangFlow(transformers.PreTrainedModel):
         seq_length: typing.Optional[int] = None,
         num_steps: int = 128,
         device: typing.Optional[torch.device] = None,
-        attention_mask: typing.Optional[torch.Tensor] = None,
-        eos_token_id: typing.Optional[int] = None,
     ) -> torch.LongTensor:
         """Generate samples using Euler-EDM solver.
         
@@ -535,17 +524,8 @@ class LangFlow(transformers.PreTrainedModel):
             seq_length = self.config.model_length
         if device is None:
             device = next(self.parameters()).device
-        if attention_mask is not None:
-            attention_mask = attention_mask.to(device=device, dtype=torch.bool)
-            if attention_mask.shape != (num_samples, seq_length):
-                raise ValueError(
-                    f"attention_mask must have shape {(num_samples, seq_length)}, "
-                    f"got {tuple(attention_mask.shape)}"
-                )
-            if not bool(attention_mask[:, 0].all()):
-                raise ValueError("Every generated sequence must contain at least one token")
-            if eos_token_id is None:
-                raise ValueError("eos_token_id is required with attention_mask")
+        if num_steps < 2 or seq_length < 1 or num_samples < 1:
+            raise ValueError("num_steps >= 2 and positive sequence/sample counts are required")
 
         embed_dim = self.config.hidden_size
         eps = 1e-5
@@ -571,7 +551,6 @@ class LangFlow(transformers.PreTrainedModel):
                 noisy_embeds=z,
                 timesteps=gamma_expanded,
                 x_self_cond=x_self_cond,
-                attention_mask=attention_mask,
                 return_dict=False)
 
             # Convert logits to embedding prediction
@@ -592,19 +571,7 @@ class LangFlow(transformers.PreTrainedModel):
             noisy_embeds=z,
             timesteps=gamma_expanded,
             x_self_cond=x_self_cond,
-            attention_mask=attention_mask,
             return_dict=False)
         samples = logits.argmax(dim=-1)
-
-        if attention_mask is not None:
-            samples = samples.masked_fill(~attention_mask, eos_token_id)
-            terminal_positions = attention_mask.sum(dim=1) - 1
-            samples.scatter_(
-                1,
-                terminal_positions[:, None],
-                torch.full(
-                    (num_samples, 1), eos_token_id,
-                    dtype=samples.dtype, device=samples.device),
-            )
 
         return samples

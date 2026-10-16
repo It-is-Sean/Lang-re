@@ -1,11 +1,7 @@
-"""Evaluate a LangFlow checkpoint against ROCStories train/validation splits.
+"""Evaluate fixed-length LangFlow samples against packed train/validation blocks.
 
-LangFlow is an unconditional bidirectional diffusion model, so dataset rows
-cannot be used as autoregressive prompts.  For each requested split this script
-selects distinct reference stories and independently generates the same number
-of fixed-length samples.  It reports generated-text perplexity under a separate
-causal LM, mean per-sample unigram entropy, and MAUVE against that split's
-references.  Selected rows and generated texts are saved for auditing.
+The entire generated block is decoded with special tokens retained, matching
+the released Gen-PPL evaluator. References are packed blocks, never prompts.
 """
 
 from __future__ import annotations
@@ -24,6 +20,8 @@ import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from langflow import LangFlow, LangFlowConfig
+from training.data import PROTOCOL, PackedDataset, load_metadata
+from training.runtime import latest_checkpoint
 
 
 LOGGER = logging.getLogger("langflow.eval")
@@ -34,7 +32,6 @@ def build_parser() -> argparse.ArgumentParser:
         description=__doc__, formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
     parser.add_argument("--checkpoint", type=Path, required=True)
-    parser.add_argument("--config", type=Path, required=True)
     parser.add_argument("--cache-dir", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--tokenizer", default="gpt2")
@@ -73,75 +70,27 @@ def autocast_context(device: torch.device, precision: str):
     return torch.autocast(device_type=device.type, dtype=dtype, enabled=enabled)
 
 
-def load_generator(
-    checkpoint_path: Path,
-    config_path: Path,
-    tokenizer_size: int,
-    sequence_length: int,
-    weights: str,
-    device: torch.device,
-) -> LangFlow:
+def load_generator(checkpoint_path, weights, device):
+    if checkpoint_path.is_dir():
+        checkpoint_path = latest_checkpoint(checkpoint_path)
     LOGGER.info("Loading %s weights from %s", weights, checkpoint_path)
-    config = LangFlowConfig.from_pretrained(config_path)
-    config.vocab_size = tokenizer_size
-    config.model_length = sequence_length
-    model = LangFlow(config)
-    checkpoint = torch.load(
-        checkpoint_path, map_location="cpu", mmap=True, weights_only=False
-    )
-    if weights not in checkpoint:
-        raise KeyError(f"Checkpoint does not contain {weights!r} weights")
+    checkpoint = torch.load(checkpoint_path, map_location="cpu", mmap=True, weights_only=False)
+    if checkpoint.get("data_protocol") != PROTOCOL:
+        raise ValueError("This evaluator requires a paper-packed checkpoint; legacy runs use their original evaluator")
+    model = LangFlow(LangFlowConfig.from_dict(checkpoint["model_config"]))
     model.load_state_dict(checkpoint[weights])
+    fingerprint = checkpoint["data_fingerprint"]
     del checkpoint
     gc.collect()
-    return model.to(device).eval()
+    return model.to(device).eval(), fingerprint
 
 
-def select_references(
-    cache_dir: Path,
-    split: str,
-    num_samples: int,
-    seed: int,
-) -> tuple[list[int], list[list[int]]]:
-    tokens = np.load(cache_dir / f"{split}-tokens.npy", mmap_mode="r")
-    lengths = np.load(cache_dir / f"{split}-lengths.npy", mmap_mode="r")
-    eligible = np.flatnonzero(lengths > 1)
-    if num_samples > len(eligible):
-        raise ValueError(
-            f"Requested {num_samples} {split} references, only {len(eligible)} are eligible"
-        )
-    rng = np.random.default_rng(seed)
-    selected = rng.choice(eligible, size=num_samples, replace=False)
-    references = [
-        tokens[index, : int(lengths[index])].astype(np.int64).tolist()
-        for index in selected
-    ]
-    return selected.astype(np.int64).tolist(), references
-
-
-def sample_target_lengths(
-    cache_dir: Path,
-    num_samples: int,
-    sequence_length: int,
-    seed: int,
-) -> list[int]:
-    """Draw unconditional generation lengths from the training distribution."""
-    train_lengths = np.load(cache_dir / "train-lengths.npy", mmap_mode="r")
-    eligible = np.asarray(train_lengths[(train_lengths > 1)], dtype=np.int64)
-    if not len(eligible):
-        raise ValueError("Training cache contains no valid generation lengths")
-    sampled = np.random.default_rng(seed).choice(
-        eligible, size=num_samples, replace=True
-    )
-    return np.clip(sampled, 2, sequence_length).astype(np.int64).tolist()
-
-
-def truncate_at_eos(token_ids: list[int], eos_token_id: int) -> list[int]:
-    try:
-        end = token_ids.index(eos_token_id) + 1
-    except ValueError:
-        end = len(token_ids)
-    return token_ids[:end]
+def select_references(cache_dir, split, num_samples, seed):
+    dataset = PackedDataset(cache_dir, split)
+    if not 0 < num_samples <= len(dataset):
+        raise ValueError(f"Requested {num_samples} {split} blocks, only {len(dataset)} available")
+    selected = np.random.default_rng(seed).choice(len(dataset), size=num_samples, replace=False)
+    return selected.tolist(), [dataset[int(index)].tolist() for index in selected]
 
 
 @torch.inference_mode()
@@ -154,8 +103,6 @@ def generate_samples(
     seed: int,
     device: torch.device,
     precision: str,
-    target_lengths: list[int],
-    eos_token_id: int,
 ) -> list[list[int]]:
     if num_steps < 2:
         raise ValueError("num_steps must be at least two")
@@ -167,27 +114,14 @@ def generate_samples(
     generated: list[list[int]] = []
     for start in range(0, num_samples, batch_size):
         current_batch = min(batch_size, num_samples - start)
-        batch_lengths = torch.tensor(
-            target_lengths[start : start + current_batch],
-            dtype=torch.long, device=device,
-        )
-        attention_mask = (
-            torch.arange(sequence_length, device=device)[None, :]
-            < batch_lengths[:, None]
-        )
         with autocast_context(device, precision):
             token_ids = model.generate_samples(
                 num_samples=current_batch,
                 seq_length=sequence_length,
                 num_steps=num_steps,
                 device=device,
-                attention_mask=attention_mask,
-                eos_token_id=eos_token_id,
             )
-        generated.extend(
-            truncate_at_eos(ids, eos_token_id)
-            for ids in token_ids.cpu().tolist()
-        )
+        generated.extend(token_ids.cpu().tolist())
         LOGGER.info("Generated %d/%d samples", len(generated), num_samples)
     return generated
 
@@ -283,7 +217,7 @@ def write_samples(
             indices, references, generations, strict=True
         ):
             handle.write(json.dumps({
-                "dataset_index": index,
+                "block_index": index,
                 "reference": reference,
                 "generation": generation,
             }, ensure_ascii=False) + "\n")
@@ -291,6 +225,8 @@ def write_samples(
 
 def main() -> None:
     args = build_parser().parse_args()
+    if args.checkpoint.is_dir():
+        args.checkpoint = latest_checkpoint(args.checkpoint)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
     args.output_dir.mkdir(parents=True, exist_ok=True)
     seed_everything(args.seed)
@@ -300,10 +236,17 @@ def main() -> None:
         torch.backends.cuda.matmul.allow_tf32 = True
 
     tokenizer = AutoTokenizer.from_pretrained(args.tokenizer, use_fast=True)
-    generator = load_generator(
-        args.checkpoint, args.config, len(tokenizer), args.sequence_length,
-        args.weights, device,
-    )
+    generator, fingerprint = load_generator(args.checkpoint, args.weights, device)
+    metadata = load_metadata(args.cache_dir)
+    if metadata["fingerprint"] != fingerprint:
+        raise ValueError("Evaluation cache must match the checkpoint training cache")
+    if (args.sequence_length != generator.config.model_length
+            or args.sequence_length != fingerprint["sequence_length"]
+            or args.tokenizer != fingerprint["tokenizer"]
+            or len(tokenizer) != generator.config.vocab_size):
+        raise ValueError("Tokenizer/sequence length must match the checkpoint")
+    if args.num_samples_per_split < 1 or args.ppl_batch_size < 1 or args.mauve_batch_size < 1:
+        raise ValueError("Sample count and scoring batch sizes must be positive")
 
     split_outputs: dict[str, dict] = {}
     for split_number, split in enumerate(args.splits):
@@ -312,28 +255,22 @@ def main() -> None:
             args.cache_dir, split, args.num_samples_per_split,
             args.seed + split_number,
         )
-        target_lengths = sample_target_lengths(
-            args.cache_dir, args.num_samples_per_split, args.sequence_length,
-            args.seed + 20_000 + split_number,
-        )
         generated_ids = generate_samples(
             generator, args.num_samples_per_split, args.sequence_length,
             args.num_steps, args.generation_batch_size,
             args.seed + 10_000 + split_number, device, args.precision,
-            target_lengths, tokenizer.eos_token_id,
         )
-        reference_texts = tokenizer.batch_decode(reference_ids, skip_special_tokens=True)
-        generated_texts = tokenizer.batch_decode(generated_ids, skip_special_tokens=True)
+        reference_texts = tokenizer.batch_decode(reference_ids, skip_special_tokens=False)
+        generated_texts = tokenizer.batch_decode(generated_ids, skip_special_tokens=False)
         write_samples(
             args.output_dir / f"{split}-samples.jsonl",
             indices, reference_texts, generated_texts,
         )
         split_outputs[split] = {
-            "dataset_indices": indices,
+            "block_indices": indices,
             "reference_texts": reference_texts,
             "generated_texts": generated_texts,
             "sample_entropy": mean_unigram_entropy(generated_ids),
-            "mean_target_tokens": float(np.mean(target_lengths)),
             "mean_generated_tokens": float(np.mean([len(ids) for ids in generated_ids])),
             "mean_reference_tokens": float(np.mean([len(ids) for ids in reference_ids])),
         }
@@ -376,6 +313,8 @@ def main() -> None:
 
     results = {
         "timestamp": datetime.now().isoformat(timespec="seconds"),
+        "data_protocol": PROTOCOL,
+        "data_fingerprint": fingerprint,
         "args": {
             key: str(value) if isinstance(value, Path) else value
             for key, value in vars(args).items()
@@ -389,7 +328,7 @@ def main() -> None:
     summary = {
         split: {
             key: value for key, value in values.items()
-            if key not in {"dataset_indices", "reference_texts", "generated_texts"}
+            if key not in {"block_indices", "reference_texts", "generated_texts"}
         }
         for split, values in split_outputs.items()
     }

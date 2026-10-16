@@ -63,8 +63,16 @@ python inference.py \
 `train.py` implements Algorithm 1 from the paper: CE denoising on the VP
 embedding path, a learned Gumbel log-NSR scheduler and its detached fitting
 loss, 25% self-conditioning, low-discrepancy noise sampling, the 5K-step bias
-warmup, and EMA. The first launch converts the raw text files to reusable token
-memmaps beside the dataset.
+warmup, and EMA. The first launch converts raw documents to reusable packed
+memmaps beside the dataset. Documents are split before packing, tokenized
+without truncation, and terminated with EOS. Following the released dataloader,
+each batch of 1,000 documents is concatenated, chunked into `L-2` token payloads
+(dropping its incomplete tail), and wrapped in BOS/EOS. Every position is valid.
+
+Sampling always denoises a full fixed-length block. EOS is learned by the same
+token CE as the rest of the vocabulary: it does not stop diffusion, select a
+length, or get forced into the output. Decoding for Gen-PPL retains special
+tokens and does not truncate at EOS.
 
 The expected dataset layout is:
 
@@ -101,7 +109,10 @@ be divisible by `world_size * micro_batch_size`; accumulation is derived
 automatically. To cap a run by optimizer updates, pass `--max_steps` (the paper
 uses 1M updates for LM1B/OWT). Resume with either
 `--resume path/to/step-XXXXXXX.pt` or `--resume_latest`. Checkpoints contain the
-model, EMA, optimizer, LR scheduler, scaler, data position, and RNG state. At
+model, EMA, optimizer, LR scheduler, scaler, data position, and each rank's RNG
+state. Exact resume checks the data fingerprint, model configuration, world
+size and training hyperparameters. Legacy story-aligned checkpoints/caches
+cannot be resumed under the new protocol. At
 the end of training, Hugging Face-compatible weights are exported to
 `final-model/` and `final-ema/`.
 
@@ -109,23 +120,44 @@ To checkpoint and exit a running job cleanly after its next complete optimizer
 update, create a marker in that run directory:
 
 ```bash
-touch results/langflow-tinystories-*/SAVE_AND_STOP
+touch results/langflow-tinystories/SAVE_AND_STOP
 ```
 
 Rank zero writes the checkpoint atomically and all distributed ranks exit
-together. Resume it with `--resume /path/to/step-XXXXXXX.pt`.
+together. Remove that run's marker before resuming with
+`--resume /path/to/step-XXXXXXX.pt`.
 
-Useful development smoke test:
+### ROCStories adaptation
+
+From the MSEFlow root, run `bash experiments/langflow-rocstories-130m.sh`.
+It reads the original CSV, writes a separate `paper-packed-gpt2-l64` cache and
+uses CUDA devices `4,5` by default (override `CUDA_VISIBLE_DEVICES` if needed).
+The experiment uses length 64, global batch 128, micro-batch 32 per GPU, 20
+epochs, 400-update LR warmup to a constant `1e-4`, 500-update bias warmup and
+EMA 0.999. The shorter bias warmup is an adaptation to this small dataset, not
+the paper's original 5,000-update setting. Learned Gumbel noise scheduling is
+unchanged. This matches the paper's method, not its LM1B/OWT training scale.
+
+`bash eval/eval-langflow-rocstories.sh` evaluates the latest numeric-step
+checkpoint with EMA, packed references, full-block Gen-PPL and auxiliary MAUVE.
+Old story-aligned/length-aware scores are not directly comparable.
+Validation CE uses a fixed initial Gumbel distribution and fixed noise, with
+and without self-conditioning; it is a diagnostic, not a likelihood estimate.
+
+### Code and regression tests
+
+`train.py` is a thin CLI; `training/data.py`, `objective.py`, `runtime.py` and
+`trainer.py` own packing, the loss, distributed/checkpoint state and the loop.
+Tests create isolated temporary fixtures and do not touch production runs:
 
 ```bash
-python train.py \
-    --sequence_length 32 \
-    --global_batch_size 2 \
-    --micro_batch_size 1 \
-    --max_steps 2 \
-    --num_workers 0 \
-    --precision fp32
+python -m unittest discover -s tests -p 'test_*.py' -v
+python tests/smoke_training.py --gpus 4,5
 ```
+
+The smoke test checks bitwise-equal uninterrupted/resumed model and EMA weights,
+checkpoint loading, packed references, fixed-length generation and the Gen-PPL
+pipeline with a small local scorer. It is not a generation-quality benchmark.
 
 ## Citation
 

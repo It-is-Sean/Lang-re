@@ -85,7 +85,7 @@ def main():
             remaining -= batch
 
     all_samples = torch.cat(all_samples, dim=0)
-    texts = tokenizer.batch_decode(all_samples, skip_special_tokens=True)
+    texts = tokenizer.batch_decode(all_samples, skip_special_tokens=False)
     for i, text in enumerate(texts):
         print(f"\n--- Sample {i + 1} ---")
         print(text[:500] + ("..." if len(text) > 500 else ""))
