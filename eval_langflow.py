@@ -43,7 +43,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--splits", nargs="+", choices=("train", "validation"),
         default=("train", "validation"),
     )
-    parser.add_argument("--num-samples-per-split", type=int, default=256)
+    parser.add_argument("--num-samples-per-split", type=int, default=2000)
     parser.add_argument("--sequence-length", type=int, default=64)
     parser.add_argument("--num-steps", type=int, default=128)
     parser.add_argument("--generation-batch-size", type=int, default=8)
