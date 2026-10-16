@@ -51,6 +51,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--mauve-model", default="gpt2-large")
     parser.add_argument("--mauve-batch-size", type=int, default=32)
     parser.add_argument("--mauve-max-text-length", type=int, default=64)
+    parser.add_argument("--skip-mauve", action="store_true", help="Gen-PPL-only checkpoint screening")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", default="cuda:0" if torch.cuda.is_available() else "cpu")
     return parser
@@ -302,7 +303,7 @@ def main() -> None:
     if device.type == "cuda":
         torch.cuda.empty_cache()
 
-    for split_number, split in enumerate(args.splits):
+    for split_number, split in enumerate(args.splits if not args.skip_mauve else []):
         LOGGER.info("Computing MAUVE for %s", split)
         split_outputs[split].update(compute_mauve(
             split_outputs[split]["reference_texts"],
@@ -312,6 +313,8 @@ def main() -> None:
         ))
 
     results = {
+        "complete": True,
+        "mauve_computed": not args.skip_mauve,
         "timestamp": datetime.now().isoformat(timespec="seconds"),
         "data_protocol": PROTOCOL,
         "data_fingerprint": fingerprint,
