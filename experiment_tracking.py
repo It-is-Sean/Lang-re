@@ -64,7 +64,7 @@ def start(config, output_dir, *, model, job_type, log_dir=None, rank=0, group_di
     # Do not inherit an ID from a parent process (e.g. a checkpoint sweep).
     _run = wandb.init(
         project=os.environ.get("WANDB_PROJECT") or "MSEFlow",
-        entity=os.environ.get("WANDB_ENTITY") or "yunchenjiang-university-of-illinois-urbana-champaign-org",
+        entity=os.environ.get("WANDB_ENTITY") or "yunchenjiang-university-of-illinois-urbana-champaign",
         mode=mode, dir=str(directory), id=uuid.uuid4().hex[:8], resume="never",
         name=os.environ.get("WANDB_NAME") or f"{model}-{job_type}-{Path(output_dir).name}",
         group=os.environ.get("WANDB_RUN_GROUP") or default_group,
