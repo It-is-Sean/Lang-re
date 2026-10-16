@@ -1,4 +1,4 @@
-"""Evaluate a ROCStories AR checkpoint on sampled train/validation prompts.
+"""Evaluate packed AR unconditionally, or legacy story checkpoints on prompts.
 
 For each split, this script samples distinct reference stories, keeps a fixed
 prefix as the prompt, generates an autoregressive continuation, and reports:
@@ -18,6 +18,7 @@ import json
 import logging
 import math
 import random
+import re
 from datetime import datetime
 from pathlib import Path
 
@@ -26,6 +27,8 @@ import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from langflow.ar_model import LangFlowAR
+from training.data import PROTOCOL, load_metadata
+from eval_langflow import select_references
 
 
 LOGGER = logging.getLogger("langflow.eval_ar")
@@ -77,6 +80,8 @@ def load_generator(checkpoint_path: Path, weights: str, device: torch.device) ->
         dropout=float(config["dropout"]),
     )
     model.load_state_dict(checkpoint[weights])
+    model.data_protocol = checkpoint.get('data_protocol', 'story-aligned')
+    model.data_fingerprint = checkpoint.get('data_fingerprint')
     del checkpoint
     gc.collect()
     return model.to(device).eval()
@@ -138,6 +143,7 @@ def generate_continuations(
     top_k: int,
     seed: int,
     device: torch.device,
+    stop_at_eos: bool = True,
 ) -> list[list[int]]:
     if temperature <= 0:
         raise ValueError("temperature must be positive")
@@ -150,20 +156,22 @@ def generate_continuations(
     for start in range(0, len(prompts), batch_size):
         token_ids = prompts[start : start + batch_size].to(device, non_blocking=True)
         finished = torch.zeros(token_ids.shape[0], dtype=torch.bool, device=device)
-        while token_ids.shape[1] < max_length and not bool(finished.all()):
+        while token_ids.shape[1] < max_length and (not stop_at_eos or not bool(finished.all())):
             with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=device.type == "cuda"):
                 logits = model(token_ids)[:, -1]
             next_token = sample_next_token(logits, temperature, top_p, top_k, rng)
-            next_token = torch.where(finished, torch.full_like(next_token, eos_token_id), next_token)
+            if stop_at_eos:
+                next_token = torch.where(finished, torch.full_like(next_token, eos_token_id), next_token)
             token_ids = torch.cat((token_ids, next_token[:, None]), dim=1)
             finished |= next_token.eq(eos_token_id)
 
         for row in token_ids.cpu().tolist():
-            try:
-                eos_position = row.index(eos_token_id, prompts.shape[1])
-                row = row[: eos_position + 1]
-            except ValueError:
-                pass
+            if stop_at_eos:
+                try:
+                    eos_position = row.index(eos_token_id, prompts.shape[1])
+                    row = row[: eos_position + 1]
+                except ValueError:
+                    pass
             generated_samples.append(row)
         LOGGER.info("Generated %d/%d samples", len(generated_samples), len(prompts))
     return generated_samples
@@ -261,7 +269,15 @@ def write_samples(
 
 def main() -> None:
     args = build_parser().parse_args()
+    if args.checkpoint.is_dir():
+        candidates = [(int(match[1]), path) for path in args.checkpoint.glob('epoch-*-step-*.pt')
+                      if (match := re.search(r'-step-(\d+)\.pt$', path.name))]
+        if not candidates:
+            raise FileNotFoundError(f'No AR checkpoints in {args.checkpoint}')
+        args.checkpoint = max(candidates)[1]
     logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
+    if args.output_dir.exists() and any(args.output_dir.iterdir()):
+        raise ValueError(f'Refusing to overwrite nonempty output directory: {args.output_dir}')
     args.output_dir.mkdir(parents=True, exist_ok=True)
     seed_everything(args.seed)
     device = torch.device(args.device)
@@ -273,21 +289,48 @@ def main() -> None:
         raise ValueError("Generator tokenizer must define eos_token_id")
 
     generator_model = load_generator(args.checkpoint, args.weights, device)
+    packed = generator_model.data_protocol == PROTOCOL
+    metadata = json.loads((args.cache_dir / 'metadata.json').read_text())
+    if packed != (metadata['fingerprint'].get('protocol') == PROTOCOL):
+        raise ValueError('Checkpoint and evaluation cache protocols differ')
+    if packed:
+        fingerprint = load_metadata(args.cache_dir)['fingerprint']
+        if generator_model.data_fingerprint != fingerprint:
+            raise ValueError('Packed cache fingerprint differs from training')
+        if (args.max_length != fingerprint['sequence_length']
+                or args.tokenizer != fingerprint['tokenizer']
+                or len(tokenizer) != fingerprint['vocab_size']
+                or tokenizer.bos_token_id != fingerprint['bos_token_id']
+                or tokenizer.eos_token_id != fingerprint['eos_token_id']
+                or args.max_ppl_length < args.max_length
+                or args.mauve_max_text_length < args.max_length):
+            raise ValueError('Packed evaluation requires matching tokenizer and full-length scoring')
+        args.prompt_length = 1
+    args.data_protocol = generator_model.data_protocol
+    args.generation_mode = 'unconditional-bos-fixed-length' if packed else 'story-prefix-continuation'
+    if args.num_samples_per_split < 1 or args.generation_batch_size < 1:
+        raise ValueError('Sample count and batch size must be positive')
     split_outputs: dict[str, dict] = {}
     for split_number, split in enumerate(args.splits):
         LOGGER.info("Selecting and generating %s split", split)
-        indices, reference_ids, prompts = select_split_samples(
-            args.cache_dir, split, args.num_samples_per_split,
-            args.prompt_length, args.seed + split_number,
-        )
+        if packed:
+            indices, reference_ids = select_references(
+                args.cache_dir, split, args.num_samples_per_split, args.seed + split_number)
+            # References are never used as prompts, not even their first token.
+            prompts = torch.full((args.num_samples_per_split, 1), tokenizer.bos_token_id, dtype=torch.long)
+        else:
+            indices, reference_ids, prompts = select_split_samples(
+                args.cache_dir, split, args.num_samples_per_split,
+                args.prompt_length, args.seed + split_number,
+            )
         generated_ids = generate_continuations(
             generator_model, prompts, tokenizer.eos_token_id, args.max_length,
             args.generation_batch_size, args.temperature, args.top_p, args.top_k,
-            args.seed + 10_000 + split_number, device,
+            args.seed + 10_000 + split_number, device, stop_at_eos=not packed,
         )
-        reference_texts = tokenizer.batch_decode(reference_ids, skip_special_tokens=True)
-        generated_texts = tokenizer.batch_decode(generated_ids, skip_special_tokens=True)
-        prompt_texts = tokenizer.batch_decode(prompts.tolist(), skip_special_tokens=True)
+        reference_texts = tokenizer.batch_decode(reference_ids, skip_special_tokens=not packed)
+        generated_texts = tokenizer.batch_decode(generated_ids, skip_special_tokens=not packed)
+        prompt_texts = tokenizer.batch_decode(prompts.tolist(), skip_special_tokens=not packed)
         write_samples(
             args.output_dir / f"{split}-samples.jsonl", indices,
             reference_texts, generated_texts, prompt_texts,
@@ -336,6 +379,8 @@ def main() -> None:
         ))
 
     results = {
+        "complete": True,
+        "data_fingerprint": metadata['fingerprint'],
         "timestamp": datetime.now().isoformat(timespec="seconds"),
         "args": {key: str(value) if isinstance(value, Path) else value for key, value in vars(args).items()},
         "splits": split_outputs,

@@ -26,6 +26,7 @@ from torch.utils.data import DataLoader, Dataset, DistributedSampler
 from transformers import AutoTokenizer
 
 from langflow.ar_model import LangFlowAR
+from training.data import PROTOCOL, PackedDataset, load_metadata
 
 
 LOGGER = logging.getLogger("langflow.train_ar")
@@ -219,6 +220,13 @@ class ROCStoriesDataset(Dataset):
         return torch.from_numpy(np.array(self.tokens[index], dtype=np.int64)), int(self.lengths[index])
 
 
+class PackedARDataset(PackedDataset):
+    """Reuse the exact diffusion cache; predict positions 1..L-1 from BOS."""
+
+    def __getitem__(self, index):
+        return super().__getitem__(index), self.length
+
+
 def precision_context(precision: str, device: torch.device):
     if device.type != "cuda" or precision == "fp32":
         return contextlib.nullcontext()
@@ -284,6 +292,8 @@ def save_checkpoint(
             "next_batch": next_batch,
             "epoch_progress": epoch_progress,
             "args": vars(args),
+            "data_protocol": args.data_protocol,
+            "data_fingerprint": args.data_fingerprint,
         },
         path,
     )
@@ -325,6 +335,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--data", type=Path, required=True)
     parser.add_argument("--cache_dir", type=Path, default=None)
     parser.add_argument("--output_dir", type=Path, required=True)
+    parser.add_argument("--log_dir", type=Path, default=None)
+    parser.add_argument("--data_protocol", choices=("story-aligned", PROTOCOL), default="story-aligned")
     parser.add_argument("--tokenizer", default="gpt2")
     parser.add_argument("--max_length", type=int, default=64)
     parser.add_argument("--validation_fraction", type=float, default=0.05)
@@ -358,7 +370,9 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> None:
     args = build_parser().parse_args()
     ctx = setup_distributed()
-    configure_logging(args.output_dir, ctx)
+    if (args.output_dir / "checkpoints").exists() and any((args.output_dir / "checkpoints").iterdir()):
+        raise ValueError("Training output already contains checkpoints; choose a new run directory")
+    configure_logging(args.log_dir or args.output_dir, ctx)
     seed_everything(args.seed, ctx.rank)
     torch.set_float32_matmul_precision("high")
     if ctx.device.type == "cuda":
@@ -379,37 +393,49 @@ def main() -> None:
     accumulation_steps = args.global_batch_size // denominator
 
     cache_dir = args.cache_dir or args.data.parent / f"tokenized-{args.tokenizer.replace('/', '--')}-l{args.max_length}"
-    metadata = prepare_rocstories(
-        args.data, cache_dir, args.tokenizer, args.max_length,
-        args.validation_fraction, args.seed, args.preprocess_workers, ctx,
-    )
+    if args.data_protocol == PROTOCOL:
+        if args.cache_dir is None:
+            raise ValueError("Packed AR requires an existing --cache_dir")
+        metadata = load_metadata(cache_dir)
+    else:
+        metadata = prepare_rocstories(
+            args.data, cache_dir, args.tokenizer, args.max_length,
+            args.validation_fraction, args.seed, args.preprocess_workers, ctx,
+        )
     tokenizer = AutoTokenizer.from_pretrained(cache_dir / "tokenizer", local_files_only=True)
-    train_dataset = ROCStoriesDataset(cache_dir, "train")
-    validation_dataset = ROCStoriesDataset(cache_dir, "validation")
+    args.data_fingerprint = metadata['fingerprint']
+    if args.data_protocol == PROTOCOL:
+        fp = args.data_fingerprint
+        if (fp['sequence_length'] != args.max_length or fp['tokenizer'] != args.tokenizer
+                or fp['vocab_size'] != len(tokenizer)
+                or fp['bos_token_id'] != tokenizer.bos_token_id
+                or fp['eos_token_id'] != tokenizer.eos_token_id):
+            raise ValueError("Packed cache length/tokenizer does not match AR configuration")
+    dataset_class = PackedARDataset if args.data_protocol == PROTOCOL else ROCStoriesDataset
+    train_dataset = dataset_class(cache_dir, "train")
+    validation_dataset = dataset_class(cache_dir, "validation")
     train_sampler = DistributedSampler(
         train_dataset, num_replicas=ctx.world_size, rank=ctx.rank,
         shuffle=True, seed=args.seed, drop_last=True,
     )
-    validation_sampler = DistributedSampler(
-        validation_dataset, num_replicas=ctx.world_size, rank=ctx.rank,
-        shuffle=False, drop_last=False,
-    ) if ctx.world_size > 1 else None
+    validation_sampler = range(ctx.rank, len(validation_dataset), ctx.world_size)
     train_loader = DataLoader(
         train_dataset, batch_size=args.micro_batch_size, sampler=train_sampler,
         num_workers=args.num_workers, pin_memory=ctx.device.type == "cuda",
         persistent_workers=args.num_workers > 0, drop_last=True,
+        generator=torch.Generator().manual_seed(args.seed + ctx.rank),
     )
     validation_loader = DataLoader(
         validation_dataset, batch_size=args.micro_batch_size, sampler=validation_sampler,
         shuffle=False, num_workers=args.num_workers,
         pin_memory=ctx.device.type == "cuda", persistent_workers=args.num_workers > 0,
+        generator=torch.Generator().manual_seed(args.seed + 10_000 + ctx.rank),
     )
 
     model = LangFlowAR(
         vocab_size=len(tokenizer), hidden_size=args.hidden_size,
         n_blocks=args.n_blocks, n_heads=args.n_heads, dropout=args.dropout,
     ).to(ctx.device)
-    ema = copy.deepcopy(model).eval().requires_grad_(False)
     if ctx.world_size > 1:
         training_model: nn.Module = DDP(
             model, device_ids=[ctx.local_rank], find_unused_parameters=False,
@@ -417,6 +443,8 @@ def main() -> None:
         )
     else:
         training_model = model
+    # DDP first synchronizes rank-zero initialization; EMA must start from it.
+    ema = copy.deepcopy(model).eval().requires_grad_(False)
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=args.learning_rate,
         betas=(args.adam_beta1, args.adam_beta2), eps=args.adam_epsilon,
