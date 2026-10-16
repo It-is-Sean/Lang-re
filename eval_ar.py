@@ -39,7 +39,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--tokenizer", default="gpt2")
     parser.add_argument("--weights", choices=("ema", "model"), default="ema")
     parser.add_argument("--splits", nargs="+", choices=("train", "validation"), default=("train", "validation"))
-    parser.add_argument("--num-samples-per-split", type=int, default=256)
+    parser.add_argument("--num-samples-per-split", type=int, default=2000)
     parser.add_argument("--prompt-length", type=int, default=8)
     parser.add_argument("--max-length", type=int, default=64)
     parser.add_argument("--generation-batch-size", type=int, default=32)
