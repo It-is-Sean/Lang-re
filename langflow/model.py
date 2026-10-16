@@ -106,12 +106,16 @@ def split_and_apply_rotary_pos_emb(qkv, rotary_cos_sin):
     return q, k, v
 
 
-def regular_attention_multi_headed(q, k, v):
+def regular_attention_multi_headed(q, k, v, attention_mask=None):
+    if attention_mask is not None:
+        # SDPA boolean masks use True for keys that participate in attention.
+        # [B, L] broadcasts across heads and query positions.
+        attention_mask = attention_mask[:, None, None, :].to(torch.bool)
     attention_output = F.scaled_dot_product_attention(
         query=q.transpose(1, 2),
         key=k.transpose(1, 2),
         value=v.transpose(1, 2),
-        attn_mask=None,
+        attn_mask=attention_mask,
         dropout_p=0.0,
         is_causal=False)
     attention_output = attention_output.transpose(1, 2)
@@ -187,7 +191,7 @@ class DDiTBlock(nn.Module):
         else:
             return bias_dropout_add_scale_fused_inference
 
-    def forward(self, x, rotary_cos_sin, c):
+    def forward(self, x, rotary_cos_sin, c, attention_mask=None):
         bias_dropout_scale_fn = self._get_bias_dropout_scale()
 
         x_skip = x
@@ -203,7 +207,7 @@ class DDiTBlock(nn.Module):
             three=3,
             h=self.n_heads)
         q, k, v = split_and_apply_rotary_pos_emb(qkv, rotary_cos_sin)
-        x = regular_attention_multi_headed(q, k, v)
+        x = regular_attention_multi_headed(q, k, v, attention_mask)
 
         x = bias_dropout_scale_fn(self.attn_out(x), None, gate_msa, x_skip, self.dropout)
         x = bias_dropout_scale_fn(
@@ -330,7 +334,14 @@ class LangFlowBackbone(nn.Module):
             self.self_cond_proj = nn.Linear(dim * 2, dim, bias=False)
             nn.init.zeros_(self.self_cond_proj.weight)
 
-    def forward(self, x_embed, sigma, x_self_cond=None, output_hidden_states=False):
+    def forward(
+        self,
+        x_embed,
+        sigma,
+        x_self_cond=None,
+        attention_mask=None,
+        output_hidden_states=False,
+    ):
         """Forward pass from embeddings.
         
         Args:
@@ -362,7 +373,7 @@ class LangFlowBackbone(nn.Module):
         # bfloat16 autocast here would silently override fp32/fp16 training and
         # makes CPU execution emit CUDA-autocast warnings.
         for block in self.blocks:
-            x = block(x, rotary_cos_sin, c=t_cond)
+            x = block(x, rotary_cos_sin, c=t_cond, attention_mask=attention_mask)
             if output_hidden_states:
                 all_hidden_states.append(x)
         x = self.output_layer(x, c=t_cond)
@@ -426,6 +437,7 @@ class LangFlow(transformers.PreTrainedModel):
         noisy_embeds: typing.Optional[torch.FloatTensor] = None,
         timesteps: typing.Optional[torch.FloatTensor] = None,
         x_self_cond: typing.Optional[torch.FloatTensor] = None,
+        attention_mask: typing.Optional[torch.Tensor] = None,
         output_hidden_states: typing.Optional[bool] = None,
         return_dict: typing.Optional[bool] = None,
         bias_scale: typing.Union[float, torch.Tensor] = 1.0,
@@ -437,6 +449,8 @@ class LangFlow(transformers.PreTrainedModel):
             noisy_embeds: [B, L, D] - Pre-noised embeddings (alternative to input_ids)
             timesteps: [B] - Gamma values (log-SNR) for conditioning
             x_self_cond: [B, L, D] - Self-conditioning embeddings
+            attention_mask: [B, L] - True for story tokens, including EOS;
+                False for padding positions ignored by bidirectional attention.
             bias_scale: Multiplier for the preconditioning skip connection.
                 Training ramps this from zero to one during warmup; inference
                 uses the default value of one.
@@ -472,7 +486,12 @@ class LangFlow(transformers.PreTrainedModel):
 
         # Get model output
         logits, all_hidden_states = self.backbone(
-            z, sigma, x_self_cond=x_self_cond, output_hidden_states=output_hidden_states)
+            z,
+            sigma,
+            x_self_cond=x_self_cond,
+            attention_mask=attention_mask,
+            output_hidden_states=output_hidden_states,
+        )
 
         # Add bias (preconditioning) skip connection
         if self.config.use_bias:

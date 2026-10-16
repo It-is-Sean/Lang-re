@@ -1,4 +1,4 @@
-"""Train LangFlow on fixed-length token blocks with the paper objective.
+"""Train LangFlow with the paper objective.
 
 The implementation follows Algorithm 1 of arXiv:2604.11748:
 
@@ -8,10 +8,11 @@ The implementation follows Algorithm 1 of arXiv:2604.11748:
 * fit the proposal to the detached per-example CE curve; and
 * use one detached model prediction for self-conditioning with probability .25.
 
-TinyStories raw text and the split ROCStories caches produced by ``train_ar.py``
-are supported.  Both are converted to flat memmaps and then packed into
-non-overlapping fixed-length blocks.  Regular Python and ``torchrun`` launches
-are supported.
+TinyStories uses fixed-length packed blocks. ROCStories directly reuses the
+story-aligned cache produced by ``train_ar.py``: each example contains all five
+sentences, is truncated to reserve a terminal EOS, and is padded to the fixed
+sequence length. Padding is excluded from attention and loss. Regular Python
+and ``torchrun`` launches are supported.
 """
 
 from __future__ import annotations
@@ -428,6 +429,53 @@ class TokenBlockDataset(Dataset[torch.Tensor]):
         return torch.from_numpy(values)
 
 
+class ROCStoriesDataset(Dataset[tuple[torch.Tensor, torch.Tensor]]):
+    """One five-sentence ROCStories example per row with a valid-token mask."""
+
+    def __init__(self, cache_dir: Path, split: str, sequence_length: int):
+        token_path = cache_dir / f"{split}-tokens.npy"
+        length_path = cache_dir / f"{split}-lengths.npy"
+        if not token_path.is_file() or not length_path.is_file():
+            raise FileNotFoundError(
+                f"Missing story-aligned ROCStories cache for {split}: "
+                f"{token_path}, {length_path}"
+            )
+        self.tokens = np.load(token_path, mmap_mode="r")
+        self.lengths = np.load(length_path, mmap_mode="r")
+        self.sequence_length = sequence_length
+        if self.tokens.ndim != 2 or self.tokens.shape[0] != len(self.lengths):
+            raise ValueError(
+                f"Invalid ROCStories cache shapes: tokens={self.tokens.shape}, "
+                f"lengths={self.lengths.shape}"
+            )
+        if self.tokens.shape[1] != sequence_length:
+            raise ValueError(
+                f"ROCStories cache width {self.tokens.shape[1]} does not match "
+                f"sequence_length={sequence_length}; rebuild it with train_ar.py"
+            )
+
+    def __len__(self) -> int:
+        return len(self.lengths)
+
+    def __getitem__(self, index: int) -> tuple[torch.Tensor, torch.Tensor]:
+        length = int(self.lengths[index])
+        if not 1 <= length <= self.sequence_length:
+            raise ValueError(f"Invalid ROCStories length {length} at index {index}")
+        input_ids = torch.from_numpy(
+            np.array(self.tokens[index], dtype=np.int64, copy=True)
+        )
+        loss_mask = torch.arange(self.sequence_length) < length
+        return input_ids, loss_mask
+
+
+def unpack_batch(batch) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return token IDs and a valid-token mask for packed or padded datasets."""
+    if isinstance(batch, (tuple, list)):
+        input_ids, loss_mask = batch
+        return input_ids, loss_mask.to(torch.bool)
+    return batch, torch.ones_like(batch, dtype=torch.bool)
+
+
 class LangFlowTrainingObjective(nn.Module):
     def __init__(self, model: LangFlow, self_condition_probability: float):
         super().__init__()
@@ -437,6 +485,7 @@ class LangFlowTrainingObjective(nn.Module):
     def forward(
         self,
         input_ids: torch.Tensor,
+        loss_mask: torch.Tensor,
         quantiles: torch.Tensor,
         bias_scale: float,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -458,6 +507,7 @@ class LangFlowTrainingObjective(nn.Module):
                         noisy_embeds=noisy_embeddings.index_select(0, active_indices),
                         timesteps=gamma.index_select(0, active_indices),
                         x_self_cond=None,
+                        attention_mask=loss_mask.index_select(0, active_indices),
                         bias_scale=bias_scale,
                         return_dict=False,
                     )
@@ -469,6 +519,7 @@ class LangFlowTrainingObjective(nn.Module):
             noisy_embeds=noisy_embeddings,
             timesteps=gamma,
             x_self_cond=self_condition,
+            attention_mask=loss_mask,
             bias_scale=bias_scale,
             return_dict=False,
         )
@@ -477,7 +528,11 @@ class LangFlowTrainingObjective(nn.Module):
             input_ids.flatten(),
             reduction="none",
         ).view_as(input_ids)
-        per_example_ce = token_loss.mean(dim=1)
+        float_mask = loss_mask.to(token_loss.dtype)
+        per_example_ce = (
+            (token_loss * float_mask).sum(dim=1)
+            / float_mask.sum(dim=1).clamp_min(1)
+        )
         ce_loss = per_example_ce.mean()
 
         proposal = self.model.proposal
@@ -630,10 +685,12 @@ def validate(
         torch.manual_seed(17_029 + ctx.rank)
         if ctx.device.type == "cuda":
             torch.cuda.manual_seed(17_029 + ctx.rank)
-        for batch_index, input_ids in enumerate(loader):
+        for batch_index, batch in enumerate(loader):
             if batch_index >= num_batches:
                 break
+            input_ids, loss_mask = unpack_batch(batch)
             input_ids = input_ids.to(ctx.device, non_blocking=True)
+            loss_mask = loss_mask.to(ctx.device, non_blocking=True)
             sample_indices = (
                 (batch_index * loader.batch_size + torch.arange(input_ids.shape[0], device=ctx.device))
                 * ctx.world_size
@@ -643,10 +700,20 @@ def validate(
             quantiles = ((sample_indices + 0.5) / denominator).clamp(1e-5, 1.0 - 1e-5)
             gamma = model.proposal(quantiles).detach()
             with precision_context(precision, ctx.device):
-                logits = model(input_ids=input_ids, timesteps=gamma, bias_scale=1.0, return_dict=False)
-                loss = F.cross_entropy(logits.float().flatten(0, 1), input_ids.flatten())
-            total_loss += loss * input_ids.shape[0]
-            total_examples += input_ids.shape[0]
+                logits = model(
+                    input_ids=input_ids,
+                    timesteps=gamma,
+                    attention_mask=loss_mask,
+                    bias_scale=1.0,
+                    return_dict=False,
+                )
+                token_loss = F.cross_entropy(
+                    logits.float().flatten(0, 1),
+                    input_ids.flatten(),
+                    reduction="none",
+                ).view_as(input_ids)
+            total_loss += (token_loss * loss_mask).sum()
+            total_examples += loss_mask.sum()
     if ctx.world_size > 1:
         dist.all_reduce(total_loss)
         dist.all_reduce(total_examples)
@@ -726,8 +793,19 @@ def main() -> None:
         raise ValueError("save_every_fraction must be in [0, 1]")
 
     if args.dataset == "rocstories":
-        cache_dir = args.cache_dir or args.data_dir.parent / f"{args.data_dir.name}-packed"
-        metadata = prepare_rocstories(args.data_dir, cache_dir, args.tokenizer, ctx)
+        cache_dir = args.data_dir
+        metadata_path = cache_dir / "metadata.json"
+        if not metadata_path.is_file():
+            raise FileNotFoundError(
+                f"Missing story-aligned ROCStories metadata: {metadata_path}"
+            )
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        fingerprint = metadata.get("fingerprint", {})
+        if fingerprint.get("tokenizer") != args.tokenizer:
+            raise ValueError(
+                f"ROCStories cache tokenizer {fingerprint.get('tokenizer')!r} "
+                f"does not match requested tokenizer {args.tokenizer!r}"
+            )
     else:
         cache_dir = args.cache_dir or args.data_dir / f"tokenized-{args.tokenizer.replace('/', '--')}"
         metadata = prepare_tinystories(args.data_dir, cache_dir, args.tokenizer, args.preprocess_workers, ctx)
@@ -745,9 +823,19 @@ def main() -> None:
     if config.vocab_size != len(tokenizer):
         raise ValueError(f"Model vocabulary ({config.vocab_size}) != tokenizer vocabulary ({len(tokenizer)})")
 
-    dtype = metadata["fingerprint"]["dtype"]
-    train_dataset = TokenBlockDataset(cache_dir / "train.bin", dtype, sequence_length)
-    valid_dataset = TokenBlockDataset(cache_dir / "validation.bin", dtype, sequence_length)
+    if args.dataset == "rocstories":
+        cache_length = int(metadata.get("fingerprint", {}).get("max_length", -1))
+        if cache_length != sequence_length:
+            raise ValueError(
+                f"ROCStories cache max_length={cache_length} does not match "
+                f"sequence_length={sequence_length}"
+            )
+        train_dataset = ROCStoriesDataset(cache_dir, "train", sequence_length)
+        valid_dataset = ROCStoriesDataset(cache_dir, "validation", sequence_length)
+    else:
+        dtype = metadata["fingerprint"]["dtype"]
+        train_dataset = TokenBlockDataset(cache_dir / "train.bin", dtype, sequence_length)
+        valid_dataset = TokenBlockDataset(cache_dir / "validation.bin", dtype, sequence_length)
     train_sampler = DistributedSampler(
         train_dataset, num_replicas=ctx.world_size, rank=ctx.rank, shuffle=True, seed=args.seed, drop_last=True
     )
@@ -854,7 +942,7 @@ def main() -> None:
         with (args.output_dir / "args.json").open("w", encoding="utf-8") as handle:
             json.dump(vars(args), handle, indent=2, default=str)
         LOGGER.info(
-            "Model parameters: %s | train blocks: %s | validation blocks: %s",
+            "Model parameters: %s | train examples: %s | validation examples: %s",
             f"{sum(parameter.numel() for parameter in model.parameters()):,}",
             f"{len(train_dataset):,}",
             f"{len(valid_dataset):,}",
@@ -893,7 +981,7 @@ def main() -> None:
         last_epoch = epoch
         train_sampler.set_epoch(epoch)
         update_in_epoch = start_batch // accumulation_steps if epoch == start_epoch else 0
-        for batch_index, input_ids in enumerate(train_loader):
+        for batch_index, batch in enumerate(train_loader):
             if update_in_epoch >= complete_updates_per_epoch:
                 break
             if args.max_steps > 0 and step >= args.max_steps:
@@ -902,11 +990,13 @@ def main() -> None:
             if epoch == start_epoch and batch_index < start_batch:
                 continue
             last_batch = batch_index + 1
+            input_ids, loss_mask = unpack_batch(batch)
             if quantiles_for_rank is None:
                 quantiles_for_rank = sample_low_discrepancy_quantiles(args.global_batch_size, ctx)
             q_start = accumulation_index * args.micro_batch_size
             quantiles = quantiles_for_rank[q_start : q_start + args.micro_batch_size]
             input_ids = input_ids.to(ctx.device, non_blocking=True)
+            loss_mask = loss_mask.to(ctx.device, non_blocking=True)
             bias_scale = min(1.0, step / max(1, args.bias_warmup_steps))
             final_micro_step = accumulation_index + 1 == accumulation_steps
             sync_context = contextlib.nullcontext()
@@ -918,7 +1008,9 @@ def main() -> None:
             # the next accumulated micro-batch.
             with sync_context:
                 with precision_context(args.precision, ctx.device):
-                    total_loss, ce_loss, scheduler_loss = objective(input_ids, quantiles, bias_scale)
+                    total_loss, ce_loss, scheduler_loss = objective(
+                        input_ids, loss_mask, quantiles, bias_scale
+                    )
                     scaled_loss = total_loss / accumulation_steps
                 scaler.scale(scaled_loss).backward()
             running += torch.stack((total_loss.detach(), ce_loss, scheduler_loss)) / accumulation_steps
