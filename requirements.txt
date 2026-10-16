@@ -8,3 +8,4 @@ safetensors
 huggingface-hub
 numpy
 mauve-text
+wandb>=0.19,<1

@@ -17,6 +17,7 @@ from torch.utils.data import DataLoader, DistributedSampler
 from transformers import AutoTokenizer
 
 from langflow import LangFlow, LangFlowConfig
+import experiment_tracking as tracking
 from .data import PROTOCOL, PackedDataset, load_metadata, prepare_data
 from .objective import LangFlowTrainingObjective, validate
 from .runtime import (
@@ -261,6 +262,14 @@ def run(args, ctx):
 
     barrier(ctx)
 
+    tracking.start(
+        {**vars(args), "data_protocol": PROTOCOL, "data_fingerprint": fingerprint,
+         "world_size": ctx.world_size, "accumulation_steps": accumulation_steps,
+         "updates_per_epoch": complete_updates_per_epoch, "start_step": start_step,
+         "model_config": model.config.to_dict()},
+        args.output_dir, model="langflow", job_type="train", log_dir=log_dir, rank=ctx.rank,
+    )
+
     def save(epoch, batch, final=False):
         suffix = "-final" if final else ""
         save_checkpoint(
@@ -345,6 +354,17 @@ def run(args, ctx):
                 metrics = reduce_metrics(running / max(1, running_updates), ctx)
                 elapsed = time.monotonic() - log_started
                 if ctx.is_main:
+                    tracking.log({
+                        "train/loss": metrics[0].item(), "train/ce": metrics[1].item(),
+                        "train/scheduler_loss": metrics[2].item(),
+                        "train/epoch": epoch + update_in_epoch / complete_updates_per_epoch,
+                        "train/lr": optimizer.param_groups[0]["lr"],
+                        "perf/steps_per_second": running_updates / max(elapsed, 1e-9),
+                        "schedule/loc": model.proposal.loc.item(),
+                        "schedule/scale": model.proposal.scale.item(),
+                        "schedule/entropy": model.proposal.entropy.item(),
+                        "schedule/bias_scale": bias_scale,
+                    }, step=step)
                     LOGGER.info(
                         "step=%07d epoch=%d loss=%.4f ce=%.4f scheduler=%.4f lr=%.3e "
                         "steps/s=%.3f peak_memory_gib=%.2f",
@@ -373,12 +393,14 @@ def run(args, ctx):
             stop_requested = save_and_stop_requested(args.output_dir, ctx)
             if fractional_due or (args.validate_every > 0 and step % args.validate_every == 0):
                 scores = validate(ema, valid_loader, ctx, args.precision, args.validation_batches)
+                tracking.log({f"val/{key}": value for key, value in scores.items()}, step=step)
                 LOGGER.info("step=%07d validation_ce_no_sc=%.4f validation_ce_sc=%.4f",
                             step, scores["ce_no_sc"], scores["ce_sc"])
             # One checkpoint per step, even when multiple triggers coincide.
             if stop_requested or fractional_due or (args.checkpoint_every > 0 and step % args.checkpoint_every == 0):
                 save(epoch, batch_index + 1)
             if stop_requested:
+                tracking.summary({"stopped_by_request": True, "final_optimizer_step": step})
                 LOGGER.info("Saved current progress and stopped by SAVE_AND_STOP request")
                 return
 
@@ -398,9 +420,11 @@ def run(args, ctx):
             exported.save_pretrained(args.output_dir / name, safe_serialization=True)
             tokenizer.save_pretrained(args.output_dir / name)
         LOGGER.info("Training complete at step %d; exported model and EMA", step)
+        tracking.summary({"complete": True, "final_optimizer_step": step})
     barrier(ctx)
 
 
+@tracking.tracked
 def main():
     args = build_parser().parse_args()
     ctx = setup_distributed()

@@ -27,6 +27,7 @@ from transformers import AutoTokenizer
 
 from langflow.ar_model import LangFlowAR
 from training.data import PROTOCOL, PackedDataset, load_metadata
+import experiment_tracking as tracking
 
 
 LOGGER = logging.getLogger("langflow.train_ar")
@@ -367,6 +368,7 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+@tracking.tracked
 def main() -> None:
     args = build_parser().parse_args()
     ctx = setup_distributed()
@@ -478,6 +480,8 @@ def main() -> None:
         (args.output_dir / "training_config.json").write_text(
             json.dumps(run_config, indent=2, default=str), encoding="utf-8"
         )
+        tracking.start(run_config, args.output_dir, model="ar", job_type="train",
+                       log_dir=args.log_dir, rank=ctx.rank)
         LOGGER.info(
             "parameters=%s train=%s validation=%s world_size=%d micro_batch=%d accumulation=%d global_batch=%d",
             f"{run_config['model_parameters']:,}", f"{len(train_dataset):,}",
@@ -545,6 +549,13 @@ def main() -> None:
                     completed = epoch * complete_updates_per_epoch + update_in_epoch
                     total = args.epochs * complete_updates_per_epoch
                     eta = elapsed / max(1, completed) * (total - completed)
+                    tracking.log({
+                        "train/loss": metric.item(),
+                        "train/lr": optimizer.param_groups[0]["lr"],
+                        "train/epoch": epoch + update_in_epoch / complete_updates_per_epoch,
+                        "perf/steps_per_second": completed / max(elapsed, 1e-9),
+                        "perf/eta_seconds": eta,
+                    }, step=global_step)
                     LOGGER.info(
                         "step=%05d/%05d epoch=%.3f loss=%.4f lr=%.3e steps/s=%.3f eta=%s peak_memory_gib=%.2f",
                         global_step, total, epoch + update_in_epoch / complete_updates_per_epoch,
@@ -559,6 +570,8 @@ def main() -> None:
                 validation_loss, perplexity = validate(ema, validation_loader, ctx, args.precision)
                 epoch_progress = epoch + update_in_epoch / complete_updates_per_epoch
                 if ctx.is_main:
+                    tracking.log({"val/nll": validation_loss, "val/ppl": perplexity},
+                                 step=global_step)
                     LOGGER.info(
                         "validation epoch=%.3f loss=%.4f perplexity=%.4f",
                         epoch_progress, validation_loss, perplexity,
@@ -585,6 +598,7 @@ def main() -> None:
 
     if ctx.is_main:
         LOGGER.info("Training finished at step=%d elapsed=%s", global_step, time.strftime("%H:%M:%S", time.gmtime(time.monotonic() - started)))
+        tracking.summary({"complete": True, "final_optimizer_step": global_step})
     if ctx.world_size > 1:
         dist.destroy_process_group()
 

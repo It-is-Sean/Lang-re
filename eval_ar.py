@@ -29,6 +29,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from langflow.ar_model import LangFlowAR
 from training.data import PROTOCOL, load_metadata
 from eval_langflow import select_references
+import experiment_tracking as tracking
 
 
 LOGGER = logging.getLogger("langflow.eval_ar")
@@ -267,6 +268,7 @@ def write_samples(
             }, ensure_ascii=False) + "\n")
 
 
+@tracking.tracked
 def main() -> None:
     args = build_parser().parse_args()
     if args.checkpoint.is_dir():
@@ -310,6 +312,9 @@ def main() -> None:
     args.generation_mode = 'unconditional-bos-fixed-length' if packed else 'story-prefix-continuation'
     if args.num_samples_per_split < 1 or args.generation_batch_size < 1:
         raise ValueError('Sample count and batch size must be positive')
+    tracking.start({**vars(args), "data_fingerprint": metadata['fingerprint']},
+                   args.output_dir, model="ar", job_type="eval",
+                   group_dir=args.checkpoint.parent.parent)
     split_outputs: dict[str, dict] = {}
     for split_number, split in enumerate(args.splits):
         LOGGER.info("Selecting and generating %s split", split)
@@ -360,6 +365,7 @@ def main() -> None:
             scorer, scorer_tokenizer, split_outputs[split]["generated_texts"],
             args.ppl_batch_size, args.max_ppl_length, device,
         ))
+        tracking.log_evaluation(split_outputs, complete=False)
         LOGGER.info(
             "%s Gen PPL=%.4f entropy=%.4f", split,
             split_outputs[split]["gen_ppl"], split_outputs[split]["sample_entropy"],
@@ -397,6 +403,7 @@ def main() -> None:
         json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8"
     )
     LOGGER.info("Evaluation complete: %s", output_path)
+    tracking.log_evaluation(summary, complete=True)
     print(json.dumps(summary, indent=2, ensure_ascii=False))
 
 
