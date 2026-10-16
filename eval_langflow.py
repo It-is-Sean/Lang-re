@@ -66,6 +66,21 @@ def seed_everything(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
+def validate_arguments(args) -> None:
+    if args.output_dir.exists() and any(args.output_dir.iterdir()):
+        raise ValueError(f"Refusing to overwrite nonempty output directory: {args.output_dir}")
+    if min(args.num_samples_per_split, args.generation_batch_size,
+           args.ppl_batch_size, args.mauve_batch_size) < 1:
+        raise ValueError("Sample count and batch sizes must be positive")
+    if args.sequence_length < 3 or args.num_steps < 2:
+        raise ValueError("Packed generation requires length >= 3 and num_steps >= 2")
+    if (args.max_ppl_length < args.sequence_length
+            or (not args.skip_mauve and args.mauve_max_text_length < args.sequence_length)):
+        raise ValueError("Scoring length must cover the entire packed block")
+    if len(set(args.splits)) != len(args.splits):
+        raise ValueError("Evaluation splits must be unique")
+
+
 def autocast_context(device: torch.device, precision: str):
     enabled = device.type == "cuda" and precision != "fp32"
     dtype = torch.bfloat16 if precision == "bf16" else torch.float16
@@ -228,6 +243,7 @@ def write_samples(
 @tracking.tracked
 def main() -> None:
     args = build_parser().parse_args()
+    validate_arguments(args)
     if args.checkpoint.is_dir():
         args.checkpoint = latest_checkpoint(args.checkpoint)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
@@ -248,9 +264,6 @@ def main() -> None:
             or args.tokenizer != fingerprint["tokenizer"]
             or len(tokenizer) != generator.config.vocab_size):
         raise ValueError("Tokenizer/sequence length must match the checkpoint")
-    if args.num_samples_per_split < 1 or args.ppl_batch_size < 1 or args.mauve_batch_size < 1:
-        raise ValueError("Sample count and scoring batch sizes must be positive")
-
     tracking.start({**vars(args), "data_protocol": PROTOCOL, "data_fingerprint": fingerprint},
                    args.output_dir, model="langflow", job_type="eval",
                    group_dir=args.checkpoint.parent.parent)
