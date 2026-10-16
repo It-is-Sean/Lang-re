@@ -19,9 +19,7 @@ class TrackingTests(unittest.TestCase):
         self.run.id = "test-id"
         self.run.project = "test-project"
         self.run.summary = {}
-        self.sdk = types.SimpleNamespace(
-            init=MagicMock(return_value=self.run),
-            util=types.SimpleNamespace(generate_id=lambda: "test-id"))
+        self.sdk = types.SimpleNamespace(init=MagicMock(return_value=self.run))
         self.env = patch.dict(os.environ, {"WANDB_MODE": "offline"}, clear=True)
         self.env.start()
         self.addCleanup(self.env.stop)
@@ -50,6 +48,7 @@ class TrackingTests(unittest.TestCase):
         experiment()
         options = self.sdk.init.call_args.kwargs
         self.assertEqual(options["mode"], "offline")
+        self.assertRegex(options["id"], r"^[0-9a-f]{8}$")
         self.assertNotIn("api_key", options["config"])
         self.assertEqual(options["config"]["cache"], "/cache")
         self.assertIn("/logs/experiment/run", options["dir"])

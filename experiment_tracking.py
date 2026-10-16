@@ -11,6 +11,7 @@ import logging
 import os
 from pathlib import Path
 import sys
+import uuid
 
 _run = None
 
@@ -64,7 +65,7 @@ def start(config, output_dir, *, model, job_type, log_dir=None, rank=0, group_di
     _run = wandb.init(
         project=os.environ.get("WANDB_PROJECT") or "MSEFlow",
         entity=os.environ.get("WANDB_ENTITY") or "yunchenjiang-university-of-illinois-urbana-champaign-org",
-        mode=mode, dir=str(directory), id=wandb.util.generate_id(), resume="never",
+        mode=mode, dir=str(directory), id=uuid.uuid4().hex[:8], resume="never",
         name=os.environ.get("WANDB_NAME") or f"{model}-{job_type}-{Path(output_dir).name}",
         group=os.environ.get("WANDB_RUN_GROUP") or default_group,
         job_type=job_type, tags=[model, job_type], save_code=False,
