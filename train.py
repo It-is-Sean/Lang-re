@@ -727,6 +727,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--dataset", choices=("tinystories", "rocstories"), default="tinystories")
     parser.add_argument("--cache_dir", type=Path, default=None)
     parser.add_argument("--output_dir", type=Path, default=PROJECT_DIR / "results/langflow-tinystories")
+    parser.add_argument(
+        "--log_dir",
+        type=Path,
+        default=None,
+        help="Log directory; defaults to output_dir when omitted",
+    )
     parser.add_argument("--config", type=Path, default=PROJECT_DIR / "langflow/config.json")
     parser.add_argument("--tokenizer", default="gpt2")
     parser.add_argument("--init_from", default=None, help="Optional Hugging Face model name or local model directory")
@@ -775,7 +781,7 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> None:
     args = build_parser().parse_args()
     ctx = setup_distributed()
-    configure_logging(args.output_dir, ctx)
+    configure_logging(args.log_dir or args.output_dir, ctx)
     seed_everything(args.seed, ctx.rank)
     torch.set_float32_matmul_precision("high")
     if torch.cuda.is_available():
