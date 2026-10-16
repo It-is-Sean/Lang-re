@@ -62,8 +62,8 @@ def start(config, output_dir, *, model, job_type, log_dir=None, rank=0, group_di
     os.environ.setdefault("WANDB_DISABLE_GIT", "true")
     # Do not inherit an ID from a parent process (e.g. a checkpoint sweep).
     _run = wandb.init(
-        project=os.environ.get("WANDB_PROJECT", "mseflow"),
-        entity=os.environ.get("WANDB_ENTITY") or None,
+        project=os.environ.get("WANDB_PROJECT") or "MSEFlow",
+        entity=os.environ.get("WANDB_ENTITY") or "yunchenjiang-university-of-illinois-urbana-champaign-org",
         mode=mode, dir=str(directory), id=wandb.util.generate_id(), resume="never",
         name=os.environ.get("WANDB_NAME") or f"{model}-{job_type}-{Path(output_dir).name}",
         group=os.environ.get("WANDB_RUN_GROUP") or default_group,
