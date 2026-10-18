@@ -167,7 +167,7 @@ def save_checkpoint(path, model, ema, optimizer, scheduler, scaler, args,
         states[0] = state
     if ctx.is_main:
         payload = {
-            "data_protocol": PROTOCOL, "data_fingerprint": fingerprint,
+            "data_protocol": fingerprint["protocol"], "data_fingerprint": fingerprint,
             "model_config": model.config.to_dict(), "world_size": ctx.world_size,
             "model": model.state_dict(), "ema": ema.state_dict(),
             "optimizer": optimizer.state_dict(), "lr_scheduler": scheduler.state_dict(),
@@ -184,8 +184,13 @@ def save_checkpoint(path, model, ema, optimizer, scheduler, scaler, args,
 
 def restore_checkpoint(path, model, ema, optimizer, scheduler, scaler, args, ctx, fingerprint):
     checkpoint = torch.load(path, map_location="cpu", mmap=True, weights_only=False)
-    if checkpoint.get("data_protocol") != PROTOCOL:
-        raise ValueError("Cannot resume a legacy/story-aligned run under paper packing; start a new run")
+    if checkpoint.get("data_protocol") != fingerprint["protocol"]:
+        raise ValueError("Cannot resume a checkpoint under a different data protocol; start a new run")
+    saved_args = checkpoint["args"]
+    if saved_args.get("training_profile", "paper-packed") != getattr(args, "training_profile", "paper-packed"):
+        raise ValueError("Exact resume requires unchanged training_profile")
+    if saved_args.get("data_seed", saved_args["seed"]) != getattr(args, "data_seed", args.seed):
+        raise ValueError("Exact resume requires unchanged data_seed")
     if checkpoint["data_fingerprint"] != fingerprint:
         raise ValueError("Checkpoint and current packed data do not match")
     if checkpoint["model_config"] != model.config.to_dict():

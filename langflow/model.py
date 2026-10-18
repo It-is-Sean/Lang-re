@@ -367,11 +367,22 @@ class LangFlowBackbone(nn.Module):
         # Precision is controlled by the caller.  Keeping an internal CUDA
         # bfloat16 autocast here would silently override fp32/fp16 training and
         # makes CPU execution emit CUDA-autocast warnings.
-        for block in self.blocks:
-            x = block(x, rotary_cos_sin, c=t_cond)
-            if output_hidden_states:
-                all_hidden_states.append(x)
-        x = self.output_layer(x, c=t_cond)
+        # The senior ROC64 profile matches the original model's precision
+        # scope: only blocks + output in bf16; embeddings/SC/time/skip stay fp32.
+        # Cache disabled to keep no-grad self-conditioning casts out of backward.
+        if getattr(self.config, "precision_scope", None) == "backbone-bf16" and x.is_cuda:
+            with torch.autocast("cuda", dtype=torch.bfloat16, cache_enabled=False):
+                for block in self.blocks:
+                    x = block(x, rotary_cos_sin, c=t_cond)
+                    if output_hidden_states:
+                        all_hidden_states.append(x)
+                x = self.output_layer(x, c=t_cond)
+        else:
+            for block in self.blocks:
+                x = block(x, rotary_cos_sin, c=t_cond)
+                if output_hidden_states:
+                    all_hidden_states.append(x)
+            x = self.output_layer(x, c=t_cond)
 
         return x, all_hidden_states
 

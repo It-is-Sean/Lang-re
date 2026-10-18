@@ -20,6 +20,7 @@ from langflow import LangFlow, LangFlowConfig
 import experiment_tracking as tracking
 from .data import PROTOCOL, PackedDataset, load_metadata, prepare_data
 from .objective import LangFlowTrainingObjective, validate
+from . import senior_roc64
 from .runtime import (
     barrier, configure_logging, latest_checkpoint, precision_context, reduce_metrics,
     restore_checkpoint, sample_low_discrepancy_quantiles, save_and_stop_requested,
@@ -34,6 +35,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     parser.add_argument("--data_dir", type=Path, default=PROJECT_DIR.parent.parent / "datasets/TinyStoriesV2")
     parser.add_argument("--dataset", choices=("tinystories", "rocstories"), default="tinystories")
+    parser.add_argument("--training_profile", choices=("paper-packed", "senior-roc64"), default="paper-packed")
+    parser.add_argument("--data_seed", type=int, default=None, help="Sampler seed; profile defaults: training seed / 0")
     parser.add_argument("--cache_dir", type=Path, default=None)
     parser.add_argument("--validation_fraction", type=float, default=0.05)
     parser.add_argument("--output_dir", type=Path, default=PROJECT_DIR / "results/langflow-tinystories")
@@ -88,6 +91,11 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def run(args, ctx):
+    senior = args.training_profile == "senior-roc64"
+    if args.data_seed is None:
+        args.data_seed = 0 if senior else args.seed
+    if senior and (args.dataset != "rocstories" or args.tokenizer != "gpt2" or args.precision != "bf16"):
+        raise ValueError("Senior ROC64 requires dataset=rocstories, tokenizer=gpt2 and precision=bf16")
     if min(args.global_batch_size, args.micro_batch_size, args.epochs, args.log_every) <= 0:
         raise ValueError("Batch sizes, epochs and log_every must be positive")
     if not 0 <= args.ema_decay < 1 or not 0 < args.validation_fraction < 1:
@@ -106,7 +114,7 @@ def run(args, ctx):
         raise ValueError("Output contains checkpoints; resume or choose a new output directory")
     log_dir = args.log_dir or PROJECT_DIR.parent.parent / "logs" / args.output_dir.name
     configure_logging(log_dir, ctx)
-    seed_everything(args.seed, ctx.rank)
+    seed_everything(args.seed, 0 if senior else ctx.rank)
     torch.set_float32_matmul_precision("high")
     if torch.cuda.is_available():
         torch.backends.cuda.matmul.allow_tf32 = True
@@ -133,27 +141,39 @@ def run(args, ctx):
     if sequence_length < 3 or model.config.vocab_size != len(tokenizer):
         raise ValueError("Invalid sequence length or tokenizer vocabulary mismatch")
     model.config.model_length = sequence_length
+    if senior:
+        if sequence_length != 64:
+            raise ValueError("Senior ROC64 uses length 64")
+        model.config.precision_scope = "backbone-bf16"
     args.sequence_length = sequence_length
     source_dir = args.data_dir.parent if args.data_dir.is_file() else args.data_dir
     args.cache_dir = args.cache_dir or source_dir / (
         f"paper-packed-{args.tokenizer.replace('/', '--')}-l{sequence_length}"
     )
+    if senior:
+        args.cache_dir = args.data_dir
     preparation_error = [None]
     if ctx.is_main:
         try:
-            prepare_data(args, tokenizer, sequence_length)
+            if senior:
+                senior_roc64.load_metadata(args.cache_dir)
+                senior_roc64.StoryDataset(args.cache_dir, "train")
+                senior_roc64.StoryDataset(args.cache_dir, "validation")
+            else:
+                prepare_data(args, tokenizer, sequence_length)
         except Exception as error:
             preparation_error[0] = f"{type(error).__name__}: {error}"
     if ctx.world_size > 1:
         dist.broadcast_object_list(preparation_error, src=0)
     if preparation_error[0]:
         raise RuntimeError(preparation_error[0])
-    metadata = load_metadata(args.cache_dir)
+    metadata = (senior_roc64.load_metadata if senior else load_metadata)(args.cache_dir)
     fingerprint = metadata["fingerprint"]
-    train_dataset = PackedDataset(args.cache_dir, "train")
-    valid_dataset = PackedDataset(args.cache_dir, "validation")
+    dataset_class = senior_roc64.StoryDataset if senior else PackedDataset
+    train_dataset = dataset_class(args.cache_dir, "train")
+    valid_dataset = dataset_class(args.cache_dir, "validation")
     train_sampler = DistributedSampler(
-        train_dataset, num_replicas=ctx.world_size, rank=ctx.rank, shuffle=True, seed=args.seed, drop_last=True
+        train_dataset, num_replicas=ctx.world_size, rank=ctx.rank, shuffle=True, seed=args.data_seed, drop_last=True
     )
     # Shard validation without padding/duplicating its last examples.
     valid_sampler = range(ctx.rank, len(valid_dataset), ctx.world_size)
@@ -215,7 +235,8 @@ def run(args, ctx):
     )
     lr_scheduler = torch.optim.lr_scheduler.LambdaLR(
         optimizer,
-        lambda step: min(1.0, (step + 1) / max(1, args.warmup_steps)),
+        lambda step: min(1.0, (step if senior else step + 1) / max(1, args.warmup_steps))
+        if args.warmup_steps else 1.0,
     )
     scaler = torch.amp.GradScaler("cuda", enabled=args.precision == "fp16" and ctx.device.type == "cuda")
 
@@ -237,7 +258,7 @@ def run(args, ctx):
         with (args.output_dir / "args.json").open("w", encoding="utf-8") as handle:
             json.dump(vars(args), handle, indent=2, default=str)
         (args.output_dir / "data.json").write_text(json.dumps(metadata, indent=2))
-        LOGGER.info("data_protocol=%s cache=%s", PROTOCOL, args.cache_dir)
+        LOGGER.info("data_protocol=%s cache=%s", fingerprint["protocol"], args.cache_dir)
         LOGGER.info(
             "Model parameters: %s | train examples: %s | validation examples: %s",
             f"{sum(parameter.numel() for parameter in model.parameters()):,}",
@@ -263,7 +284,7 @@ def run(args, ctx):
     barrier(ctx)
 
     tracking.start(
-        {**vars(args), "data_protocol": PROTOCOL, "data_fingerprint": fingerprint,
+        {**vars(args), "data_protocol": fingerprint["protocol"], "data_fingerprint": fingerprint,
          "world_size": ctx.world_size, "accumulation_steps": accumulation_steps,
          "updates_per_epoch": complete_updates_per_epoch, "start_step": start_step,
          "model_config": model.config.to_dict()},
@@ -307,7 +328,8 @@ def run(args, ctx):
             last_batch = batch_index + 1
             input_ids = batch
             if quantiles_for_rank is None:
-                quantiles_for_rank = sample_low_discrepancy_quantiles(args.global_batch_size, ctx)
+                sampler = senior_roc64.quantiles if senior else sample_low_discrepancy_quantiles
+                quantiles_for_rank = sampler(args.global_batch_size, ctx)
             q_start = accumulation_index * args.micro_batch_size
             quantiles = quantiles_for_rank[q_start : q_start + args.micro_batch_size]
             input_ids = input_ids.to(ctx.device, non_blocking=True)
@@ -321,7 +343,7 @@ def run(args, ctx):
             # leaving the context before backward corrupts reducer state on
             # the next accumulated micro-batch.
             with sync_context:
-                with precision_context(args.precision, ctx.device):
+                with precision_context("fp32" if senior else args.precision, ctx.device):
                     total_loss, ce_loss, scheduler_loss = objective(
                         input_ids, quantiles, bias_scale
                     )
@@ -338,14 +360,16 @@ def run(args, ctx):
                 torch.nn.utils.clip_grad_norm_(model.parameters(), args.gradient_clip)
             scaler.step(optimizer)
             scaler.update()
-            with torch.no_grad():
-                model.proposal.scale.clamp_(min=1e-4)
-                model.proposal.entropy.clamp_(min=1e-4)
+            if not senior:
+                with torch.no_grad():
+                    model.proposal.scale.clamp_(min=1e-4)
+                    model.proposal.entropy.clamp_(min=1e-4)
             optimizer.zero_grad(set_to_none=True)
             lr_scheduler.step()
             step += 1
             update_in_epoch += 1
-            update_ema(ema, model, args.ema_decay)
+            decay = senior_roc64.ema_decay(args.ema_decay, step) if senior else args.ema_decay
+            update_ema(ema, model, decay)
             accumulation_index = 0
             quantiles_for_rank = None
             running_updates += 1
@@ -392,13 +416,25 @@ def run(args, ctx):
             fractional_due = update_in_epoch in fractional_save_updates
             stop_requested = save_and_stop_requested(args.output_dir, ctx)
             if fractional_due or (args.validate_every > 0 and step % args.validate_every == 0):
-                scores = validate(ema, valid_loader, ctx, args.precision, args.validation_batches)
+                if senior:
+                    scores = senior_roc64.validate(ema, valid_dataset, ctx, args.micro_batch_size,
+                                                  args.self_condition_probability, bias_scale)
+                    raw = senior_roc64.validate(model, valid_dataset, ctx, args.micro_batch_size,
+                                               args.self_condition_probability, bias_scale)
+                    scores.update({f"{k}_raw": v for k, v in raw.items()})
+                    LOGGER.info("step=%07d validation_ce=%.4f validation_loss=%.4f (EMA)",
+                                step, scores["ce"], scores["loss"])
+                else:
+                    scores = validate(ema, valid_loader, ctx, args.precision, args.validation_batches)
+                    LOGGER.info("step=%07d validation_ce_no_sc=%.4f validation_ce_sc=%.4f",
+                                step, scores["ce_no_sc"], scores["ce_sc"])
                 tracking.log({f"val/{key}": value for key, value in scores.items()}, step=step)
-                LOGGER.info("step=%07d validation_ce_no_sc=%.4f validation_ce_sc=%.4f",
-                            step, scores["ce_no_sc"], scores["ce_sc"])
             # One checkpoint per step, even when multiple triggers coincide.
             if stop_requested or fractional_due or (args.checkpoint_every > 0 and step % args.checkpoint_every == 0):
-                save(epoch, batch_index + 1)
+                # Senior run keeps exactly one full checkpoint per epoch,
+                # including the final epoch (no second final.pt copy).
+                is_final = senior and epoch + 1 == args.epochs and update_in_epoch == complete_updates_per_epoch
+                save(epoch, batch_index + 1, final=is_final)
             if stop_requested:
                 tracking.summary({"stopped_by_request": True, "final_optimizer_step": step})
                 LOGGER.info("Saved current progress and stopped by SAVE_AND_STOP request")
@@ -414,7 +450,8 @@ def run(args, ctx):
         last_batch = 0
         last_epoch = epoch + 1
 
-    save(last_epoch, last_batch, final=True)
+    if not (senior and (checkpoint_dir / f"step-{step:07d}-final.pt").exists()):
+        save(last_epoch, last_batch, final=True)
     if ctx.is_main:
         for name, exported in (("final-model", model), ("final-ema", ema)):
             exported.save_pretrained(args.output_dir / name, safe_serialization=True)

@@ -62,7 +62,8 @@ class LangFlowTrainingObjective(nn.Module):
         ce_loss = per_example_ce.mean()
 
         proposal = self.model.proposal
-        proposal_scale = proposal.scale.clamp_min(1e-4)
+        proposal_scale = (proposal.scale if getattr(self.model.config, "precision_scope", None) == "backbone-bf16"
+                          else proposal.scale.clamp_min(1e-4))
         entropy_curve = proposal.entropy * torch.exp(
             -torch.exp(-(gamma - proposal.loc) / proposal_scale)
         )
