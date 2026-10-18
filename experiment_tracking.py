@@ -37,7 +37,8 @@ def log_directory(output_dir):
     return output.parent / "logs" / output.name
 
 
-def start(config, output_dir, *, model, job_type, log_dir=None, rank=0, group_dir=None):
+def start(config, output_dir, *, model, job_type, log_dir=None, rank=0, group_dir=None,
+          resume_run_id=None):
     global _run
     if rank != 0:
         return
@@ -46,6 +47,8 @@ def start(config, output_dir, *, model, job_type, log_dir=None, rank=0, group_di
         raise ValueError("WANDB_MODE must be online, offline or disabled")
     if mode == "disabled":
         return
+    if resume_run_id is not None and (mode != "online" or job_type != "checkpoint-sweep"):
+        raise ValueError("Explicit W&B resume is only supported for online checkpoint sweeps")
     if _run is not None:
         raise RuntimeError("A tracking run is already active")
     try:
@@ -65,7 +68,8 @@ def start(config, output_dir, *, model, job_type, log_dir=None, rank=0, group_di
     _run = wandb.init(
         project=os.environ.get("WANDB_PROJECT") or "MSEFlow",
         entity=os.environ.get("WANDB_ENTITY") or "yunchenjiang-university-of-illinois-urbana-champaign",
-        mode=mode, dir=str(directory), id=uuid.uuid4().hex[:8], resume="never",
+        mode=mode, dir=str(directory), id=resume_run_id or uuid.uuid4().hex[:8],
+        resume="must" if resume_run_id else "never",
         name=os.environ.get("WANDB_NAME") or f"{model}-{job_type}-{Path(output_dir).name}",
         group=os.environ.get("WANDB_RUN_GROUP") or default_group,
         job_type=job_type, tags=[model, job_type], save_code=False,
