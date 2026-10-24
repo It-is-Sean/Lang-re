@@ -49,6 +49,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--config", type=Path, default=PROJECT_DIR / "langflow/config.json")
     parser.add_argument("--tokenizer", default="gpt2")
     parser.add_argument("--init_from", default=None, help="Optional Hugging Face model name or local model directory")
+    parser.add_argument("--init_checkpoint", type=Path, default=None,
+                        help="Senior ROC64 epoch-boundary EMA initialization; fresh optimizer, cumulative epoch/step")
     parser.add_argument("--resume", type=Path, default=None, help="A .pt checkpoint, or 'latest' via --resume_latest")
     parser.add_argument("--resume_latest", action="store_true")
 
@@ -106,8 +108,10 @@ def run(args, ctx):
         raise ValueError("Warmup steps must be nonnegative; zero disables warmup")
     if args.resume and args.resume_latest:
         raise ValueError("Use only one of --resume and --resume_latest")
-    if args.init_from and (args.resume or args.resume_latest):
-        raise ValueError("--init_from and checkpoint resume are mutually exclusive")
+    if sum(bool(value) for value in (args.init_from, args.init_checkpoint, args.resume, args.resume_latest)) > 1:
+        raise ValueError("Use only one initialization or resume option")
+    if args.init_checkpoint and not senior:
+        raise ValueError("Checkpoint EMA initialization requires senior-roc64")
     checkpoint_dir = args.output_dir / "checkpoints"
     resume_path = latest_checkpoint(checkpoint_dir) if args.resume_latest else args.resume
     if resume_path is None and checkpoint_dir.exists() and any(checkpoint_dir.glob("*.pt")):
@@ -131,7 +135,12 @@ def run(args, ctx):
         raise ValueError("save_every_fraction must be in [0, 1]")
 
     tokenizer = AutoTokenizer.from_pretrained(args.tokenizer, use_fast=True)
-    if args.init_from:
+    initial = None
+    if args.init_checkpoint:
+        initial = torch.load(args.init_checkpoint, map_location="cpu", mmap=True, weights_only=False)
+        model = LangFlow(LangFlowConfig.from_dict(initial["model_config"]))
+        model.load_state_dict(initial["ema"], strict=True)
+    elif args.init_from:
         model = LangFlow.from_pretrained(args.init_from)
     else:
         config = LangFlowConfig.from_pretrained(args.config)
@@ -200,6 +209,24 @@ def run(args, ctx):
     complete_updates_per_epoch = len(train_loader) // accumulation_steps
     if complete_updates_per_epoch < 1:
         raise ValueError("Not enough training batches for one optimizer update")
+    initial_epoch = 0
+    if initial is not None:
+        if (initial.get("data_protocol") != senior_roc64.PROTOCOL
+                or initial.get("data_fingerprint") != fingerprint
+                or initial["args"]["global_batch_size"] != args.global_batch_size):
+            raise ValueError("EMA initialization requires identical data and global batch")
+        initial_epoch, remainder = divmod(initial["step"], complete_updates_per_epoch)
+        source_microbatches = (len(train_dataset) // initial["world_size"]
+                               // initial["args"]["micro_batch_size"])
+        source_accumulation = args.global_batch_size // (initial["world_size"] * initial["args"]["micro_batch_size"])
+        completed_boundary = (initial["epoch"] == initial_epoch - 1
+                              and initial["batch_in_epoch"] == source_microbatches // source_accumulation * source_accumulation)
+        next_boundary = initial["epoch"] == initial_epoch and initial["batch_in_epoch"] == 0
+        if remainder or not (completed_boundary or next_boundary) or args.epochs <= initial_epoch:
+            raise ValueError("Require an epoch-boundary source and a larger cumulative --epochs target")
+        LOGGER.info("Initialize EMA from %s at epoch=%d step=%d; fresh optimizer, cumulative EMA/bias schedule",
+                    args.init_checkpoint, initial_epoch, initial["step"])
+        del initial
     fractional_save_updates: list[int] = []
     if args.save_every_fraction > 0:
         fractional_save_updates = sorted({
@@ -240,8 +267,8 @@ def run(args, ctx):
     )
     scaler = torch.amp.GradScaler("cuda", enabled=args.precision == "fp16" and ctx.device.type == "cuda")
 
-    start_step = 0
-    start_epoch = 0
+    start_step = initial_epoch * complete_updates_per_epoch
+    start_epoch = initial_epoch
     start_batch = 0
     if resume_path is not None:
         start_step, start_epoch, start_batch = restore_checkpoint(
